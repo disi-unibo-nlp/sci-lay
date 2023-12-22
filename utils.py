@@ -3,6 +3,7 @@ import math
 import evaluate
 import torch
 import rouge
+import json
 import numpy as np
 from statistics import mean
 from codecarbon import EmissionsTracker
@@ -67,9 +68,15 @@ def predict(trainer, predict_dataset, max_predict_samples, training_args, tokeni
                 predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
             )
             predictions = [pred.strip() for pred in predictions]
-            output_prediction_file = os.path.join(training_args.output_dir, f"generated_{split}_set.txt")
-            with open(output_prediction_file, "w") as writer:
-                writer.write("\n".join(predictions))
+            list_output_dict = []
+            for i, pred in enumerate(predictions):
+                output_dict = {"prediction": pred}
+                list_output_dict.append(output_dict)
+
+            output_prediction_file = os.path.join(training_args.output_dir, f"generated_{split}_set.json")
+            
+            with open(output_prediction_file, 'w') as json_file:
+                json.dump(list_output_dict, json_file, indent=4) 
 
 
 def compute_metrics(references, predictions):

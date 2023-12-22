@@ -1,6 +1,7 @@
-from dataclasses import dataclass
+import os
 from typing import Optional, Tuple, Union
 import numpy as np
+
 
 import torch
 import torch.utils.checkpoint
@@ -51,6 +52,10 @@ logger = logging.get_logger(__name__)
 
 EPSILON = np.finfo(np.float32).tiny
 
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+# import sparse_soft_topk
+# from jax2torch import jax2torch
+# sparse_soft_topk_mask_pav = jax2torch(sparse_soft_topk.sparse_soft_topk_mask_pav)
 
 class ContructIndicator(torch.autograd.Function):
 
@@ -112,7 +117,7 @@ class PerturbedTopKFunction(torch.autograd.Function):
         topk_results = torch.topk(perturbed_x, k=k, dim=-1, sorted=False)
         indices = topk_results.indices  # b, nS, k
         indices = torch.sort(indices, dim=-1).values  # b, nS, k
-
+        
         perturbed_output = torch.nn.functional.one_hot(indices, num_classes=d).float()
         indicators = perturbed_output.mean(dim=1)  # b, k, d
 
@@ -276,7 +281,6 @@ class DearWatsonModel(LEDPreTrainedModel):
         if self.topk_inference == "perturbated":
             indicators = PerturbedTopKFunction.apply(token_relevance.squeeze(-1), k, self.sigma, self.n_samples)
             topk_encoder_outputs = torch.einsum("b k d, b d c -> b k c", indicators, encoder_outputs[0])
-
         elif self.topk_inference == "hard":
             if self.training:        
                 indicators = PerturbedTopKFunction.apply(token_relevance.squeeze(-1), k, self.sigma, self.n_samples)

@@ -425,7 +425,7 @@ def main():
         model = DledDearWatsonForConditionalGeneration.from_pretrained(model_args.model_name_or_path, config=config)
     else:
         model = AutoModelForSeq2SeqLM.from_pretrained(model_args.model_name_or_path)
-        
+    
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
