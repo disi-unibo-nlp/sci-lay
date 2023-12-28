@@ -2,7 +2,8 @@ import os
 from typing import Optional, Tuple, Union
 import numpy as np
 
-
+import sparse_soft_topk
+from jax2torch import jax2torch
 import torch
 import torch.utils.checkpoint
 import torch.nn.functional as F
@@ -53,9 +54,7 @@ logger = logging.get_logger(__name__)
 EPSILON = np.finfo(np.float32).tiny
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-# import sparse_soft_topk
-# from jax2torch import jax2torch
-# sparse_soft_topk_mask_pav = jax2torch(sparse_soft_topk.sparse_soft_topk_mask_pav)
+sparse_soft_topk_mask_pav = jax2torch(sparse_soft_topk.sparse_soft_topk_mask_pav)
 
 class ContructIndicator(torch.autograd.Function):
 
@@ -291,11 +290,14 @@ class DearWatsonModel(LEDPreTrainedModel):
                 indicators = F.one_hot(indices)
                 indicators = F.pad(indicators, pad=(0, attention_mask.size(-1) - indicators.size(-1), 0, 0))
                 topk_encoder_outputs = torch.einsum("b k n, b n d -> b k d", indicators.float(), encoder_outputs[0])
-
         elif self.topk_inference == "gumble":
             topk_selection = self.top_k_selector(token_relevance.squeeze(-1), k)
             indicators = ContructIndicator.apply(topk_selection, k, attention_mask.size(-1))
             topk_encoder_outputs = torch.einsum("b k n, b n d -> b k d", indicators, encoder_outputs[0])
+        elif self.topk_inference == "sparse_soft_topk":
+            indicators = sparse_soft_topk_mask_pav(token_relevance.squeeze(-1), k, 1e-2)
+            import pdb; pdb.set_trace()
+            topk_encoder_outputs = torch.einsum('ij,i->ij', encoder_outputs[0], indicators)
 
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
