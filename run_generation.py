@@ -39,6 +39,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 from src.models.modeling_ledtopk import DledDearWatsonForConditionalGeneration
+from src.models.modeling_pegasus_topk import PegasusForConditionalGeneration
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.30.0.dev0")
@@ -422,7 +423,7 @@ def main():
         config.sigma = model_args.sigma
         config.topk_inference = model_args.topk_inference
         config.decr_sigma = model_args.decr_sigma
-        model = DledDearWatsonForConditionalGeneration.from_pretrained(model_args.model_name_or_path, config=config)
+        model = PegasusForConditionalGeneration.from_pretrained(model_args.model_name_or_path, config=config)
     else:
         model = AutoModelForSeq2SeqLM.from_pretrained(model_args.model_name_or_path)
     

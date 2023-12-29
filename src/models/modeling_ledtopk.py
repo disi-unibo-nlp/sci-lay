@@ -348,18 +348,18 @@ class DledDearWatsonForConditionalGeneration(LEDPreTrainedModel):
 
     def __init__(self, config: LEDConfig):
         super().__init__(config)
-        self.led = DearWatsonModel(config)
-        self.register_buffer("final_logits_bias", torch.zeros((1, self.led.shared.num_embeddings)))
-        self.lm_head = nn.Linear(config.d_model, self.led.shared.num_embeddings, bias=False)
+        self.model = DearWatsonModel(config)
+        self.register_buffer("final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings)))
+        self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
 
     def get_encoder(self):
-        return self.led.get_encoder()
+        return self.model.get_encoder()
 
     def get_decoder(self):
-        return self.led.get_decoder()
+        return self.model.get_decoder()
 
     def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
         new_embeddings = super().resize_token_embeddings(new_num_tokens)
@@ -431,7 +431,7 @@ class DledDearWatsonForConditionalGeneration(LEDPreTrainedModel):
                     labels, self.config.pad_token_id, self.config.decoder_start_token_id
                 )
 
-        outputs = self.led(
+        outputs = self.model(
             input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
