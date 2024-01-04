@@ -26,10 +26,10 @@ def main():
     bart_scorer = BARTScorer(device=device, checkpoint='facebook/bart-large-cnn')
     metric_bertscore = evaluate.load("bertscore")
 
-    with open(f'output/{args.model}/generated_{args.split}_set.json', 'r') as file:
+    with open(f'{args.output_dir}/{args.model}/generated_{args.split}_set.json', 'r') as file:
         data = json.load(file)
     
-    full_targets = [target for target in split_dataset['plain_text']]
+    full_targets = [target for target in split_dataset[args.target_column]]
     full_predictions = [pred['prediction'] for pred in data]
     data_dict = {}
     journals = set(split_dataset['journal'])
@@ -97,7 +97,7 @@ def main():
 
         full_output_string += formatted_command
 
-    with open(f'output/{args.model}/journals_results.txt', 'w') as file:
+    with open(f'{args.output_dir}/{args.model}/journals_results.txt', 'w') as file:
         file.write(full_output_string)
 
 if __name__ == "__main__":
@@ -122,6 +122,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--split",
         default="test",
+        type=str,
+    )
+    parser.add_argument(
+        "--target_column",
+        default="plain_text",
+        type=str,
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="output",
         type=str,
     )
     args = parser.parse_args()
