@@ -40,6 +40,7 @@ from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 from src.models.modeling_ledtopk import DledDearWatsonForConditionalGeneration
 from src.models.modeling_pegasus_topk import PegasusForConditionalGeneration
+from src.models.modeling_bart_topk import BartForConditionalGeneration
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.30.0.dev0")
