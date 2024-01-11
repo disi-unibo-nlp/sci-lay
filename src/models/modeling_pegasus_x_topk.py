@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021, Google and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2022, Google and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,25 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch PEGASUS model."""
+""" PyTorch PEGASUS-X model."""
 
-import copy
+import dataclasses
 import math
 import random
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.utils.checkpoint
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 from torch.nn import CrossEntropyLoss
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithPastAndCrossAttentions,
-    CausalLMOutputWithCrossAttentions,
     Seq2SeqLMOutput,
     Seq2SeqModelOutput,
 )
@@ -42,18 +41,19 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from transformers.models.pegasus.configuration_pegasus import PegasusConfig
+from transformers.models.pegasus_x.configuration_pegasus_x import PegasusXConfig
 
 
 logger = logging.get_logger(__name__)
 
-_CHECKPOINT_FOR_DOC = "google/pegasus-large"
-_CONFIG_FOR_DOC = "PegasusConfig"
+_CHECKPOINT_FOR_DOC = "google/pegasus-x-base"
+_CONFIG_FOR_DOC = "PegasusXConfig"
 
 
-PEGASUS_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    "google/pegasus-large",
-    # See all PEGASUS models at https://huggingface.co/models?filter=pegasus
+PEGASUS_X_PRETRAINED_MODEL_ARCHIVE_LIST = [
+    "google/pegasus-x-base",
+    "google/pegasus-x-large",
+    # See all PEGASUS models at https://huggingface.co/models?filter=pegasus-x
 ]
 
 
@@ -102,25 +102,24 @@ class PerturbedTopKFunction(torch.autograd.Function):
         return (grad_input,) + tuple([None] * 5)
 
 
-def compute_topk_hidden_states(self, hidden_states, n_tokens):
-    token_relevance = self.annotator_classifier(hidden_states)
-    k = int(self.top_p * n_tokens)
-    
-    if self.topk_inference == "perturbated":
-        indicators = PerturbedTopKFunction.apply(token_relevance.squeeze(-1), k, self.sigma, self.n_samples)
-        topk_encoder_outputs = torch.einsum("b k d, b d c -> b k c", indicators, hidden_states)
-    elif self.topk_inference == "hard":
-        if self.training:        
-            indicators = PerturbedTopKFunction.apply(token_relevance.squeeze(-1), k, self.sigma, self.n_samples)
-            topk_encoder_outputs = torch.einsum("b k n, b n d -> b k d", indicators, hidden_states)
-        else:
-            _, indices = torch.topk(token_relevance.squeeze(-1), k=k, dim=-1, sorted=False)
-            indices = torch.sort(indices, dim=-1).values
-            indicators = F.one_hot(indices)
-            indicators = F.pad(indicators, pad=(0, n_tokens - indicators.size(-1), 0, 0))
-            topk_encoder_outputs = torch.einsum("b k n, b n d -> b k d", indicators.float(), hidden_states)
 
-    return topk_encoder_outputs
+@dataclasses.dataclass
+class DimensionInfo:
+    """Wrapper for dimension info."""
+
+    batch_size: int  # batch size
+    seq_len: int  # token length
+    block_size: int  # block size
+    num_heads: int  # num heads
+    hidden_dim: int  # hidden dim
+    dim_per_head: int  # dim per head
+    num_blocks: int  # num blocks
+    global_len: int  # global length
+    padded_seq_len: int  # padded token seq length
+
+    # Note: Compared to the original Flax implementation, we will pad the token representations to
+    #       a multiple of block size at the start of the encoder layers, so T=P always.
+
 
 # Copied from transformers.models.bart.modeling_bart.shift_tokens_right
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
@@ -172,43 +171,34 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
-# Copied from transformers.models.marian.modeling_marian.MarianSinusoidalPositionalEmbedding with Marian->Pegasus
-class PegasusSinusoidalPositionalEmbedding(nn.Embedding):
+class PegasusXSinusoidalPositionalEmbedding(nn.Module):
     """This module produces sinusoidal positional embeddings of any length."""
 
-    def __init__(self, num_positions: int, embedding_dim: int, padding_idx: Optional[int] = None) -> None:
-        super().__init__(num_positions, embedding_dim)
-        self.weight = self._init_weight(self.weight)
-
-    @staticmethod
-    def _init_weight(out: nn.Parameter) -> nn.Parameter:
-        """
-        Identical to the XLM create_sinusoidal_embeddings except features are not interleaved. The cos features are in
-        the 2nd half of the vector. [dim // 2:]
-        """
-        n_pos, dim = out.shape
-        position_enc = np.array(
-            [[pos / np.power(10000, 2 * (j // 2) / dim) for j in range(dim)] for pos in range(n_pos)]
-        )
-        out.requires_grad = False  # set early to avoid an error in pytorch-1.8+
-        sentinel = dim // 2 if dim % 2 == 0 else (dim // 2) + 1
-        out[:, 0:sentinel] = torch.FloatTensor(np.sin(position_enc[:, 0::2]))
-        out[:, sentinel:] = torch.FloatTensor(np.cos(position_enc[:, 1::2]))
-        out.detach_()
-        return out
+    def __init__(self, embed_dim, max_scale: int = 10000.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.max_scale = max_scale
 
     @torch.no_grad()
-    def forward(self, input_ids_shape: torch.Size, past_key_values_length: int = 0) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor, past_key_values_length: int = 0) -> torch.Tensor:
         """`input_ids_shape` is expected to be [bsz x seqlen]."""
-        bsz, seq_len = input_ids_shape[:2]
+        batch_size, seq_len = input_embeds.shape[:2]
         positions = torch.arange(
-            past_key_values_length, past_key_values_length + seq_len, dtype=torch.long, device=self.weight.device
+            past_key_values_length, past_key_values_length + seq_len, dtype=torch.long, device=input_embeds.device
+        )[:, None]
+        pe = torch.zeros((seq_len, self.embed_dim), device=input_embeds.device, dtype=input_embeds.dtype)
+        half_d_feature = self.embed_dim // 2
+        div_term = torch.exp(
+            torch.arange(half_d_feature, device=input_embeds.device, dtype=input_embeds.dtype)
+            * -(np.log(float(self.max_scale)) / (half_d_feature - 1))
         )
-        return super().forward(positions)
+        pe[:, :half_d_feature] = torch.sin(positions * div_term)
+        pe[:, half_d_feature:] = torch.cos(positions * div_term)
+        return pe[None].expand(batch_size, -1, -1)
 
 
-# Copied from transformers.models.bart.modeling_bart.BartAttention with Bart->Pegasus
-class PegasusAttention(nn.Module):
+# Copied from transformers.models.bart.modeling_bart.BartAttention with Bart->PegasusX
+class PegasusXAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(
@@ -362,52 +352,307 @@ class PegasusAttention(nn.Module):
         return attn_output, attn_weights_reshaped, past_key_value
 
 
-# Copied from transformers.models.mbart.modeling_mbart.MBartEncoderLayer with MBart->Pegasus
-class PegasusEncoderLayer(nn.Module):
-    def __init__(self, config: PegasusConfig):
+class PegasusXGlobalLocalAttention(nn.Module):
+    """Global + Local attention. For use with Encoder only."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        block_size: int,
+        dropout: float = 0.0,
+        is_decoder: bool = False,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.block_size = block_size
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+
+        if (self.head_dim * num_heads) != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
+                f" and `num_heads`: {num_heads})."
+            )
+        self.scaling = self.head_dim**-0.5
+        self.is_decoder = is_decoder
+
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        token_hidden_states: torch.Tensor,
+        global_hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Input shape: Batch x Time x Channel"""
+        dim = DimensionInfo(
+            batch_size=token_hidden_states.shape[0],
+            seq_len=token_hidden_states.shape[1],
+            block_size=self.block_size,
+            num_heads=self.num_heads,
+            hidden_dim=token_hidden_states.shape[2],
+            dim_per_head=self.head_dim,
+            num_blocks=token_hidden_states.shape[1] // self.block_size,
+            global_len=global_hidden_states.shape[1],
+            padded_seq_len=token_hidden_states.shape[1],
+        )
+
+        # [batch_size, num_heads, padded_seq_len, dim_per_head]
+        local_q = self._shape(
+            self.q_proj(token_hidden_states) * self.scaling,
+            seq_len=dim.padded_seq_len,
+            bsz=dim.batch_size,
+        )
+        local_k = self._shape(
+            self.k_proj(token_hidden_states),
+            seq_len=dim.padded_seq_len,
+            bsz=dim.batch_size,
+        )
+        local_v = self._shape(
+            self.v_proj(token_hidden_states),
+            seq_len=dim.padded_seq_len,
+            bsz=dim.batch_size,
+        )
+
+        # [batch_size, num_heads, global_len, dim_per_head]
+        global_q = self._shape(
+            self.q_proj(global_hidden_states) * self.scaling,
+            seq_len=dim.global_len,
+            bsz=dim.batch_size,
+        )
+        global_k = self._shape(
+            self.k_proj(global_hidden_states),
+            seq_len=dim.global_len,
+            bsz=dim.batch_size,
+        )
+        global_v = self._shape(
+            self.v_proj(global_hidden_states),
+            seq_len=dim.global_len,
+            bsz=dim.batch_size,
+        )
+
+        global_attn_output, global_attn_probs = self.compute_global_attention_representations(
+            global_q=global_q,
+            global_k=global_k,
+            global_v=global_v,
+            local_k=local_k,
+            local_v=local_v,
+            mask=attention_mask,
+            dim=dim,
+        )
+        local_attn_output, local_attn_probs = self.compute_local_attention_representations(
+            global_k=global_k,
+            global_v=global_v,
+            local_q=local_q,
+            local_k=local_k,
+            local_v=local_v,
+            mask=attention_mask,
+            dim=dim,
+        )
+
+        # [batch_size, global_len, hidden_dim]
+        global_attn_output = (
+            global_attn_output.transpose(1, 2).contiguous().view(dim.batch_size, dim.global_len, dim.hidden_dim)
+        )
+        # [batch_size, global_len, hidden_dim]
+        global_attn_output = self.out_proj(global_attn_output)
+        # [batch_size, num_heads, block_size, num_heads, dim_per_head]
+        local_attn_output = local_attn_output.permute(0, 2, 3, 1, 4).contiguous()
+        # [batch_size, padded_seq_len, hidden_dim]
+        local_attn_output = local_attn_output.view(dim.batch_size, dim.padded_seq_len, dim.hidden_dim)
+        # [batch_size, padded_seq_len, hidden_dim]
+        local_attn_output = self.out_proj(local_attn_output)
+
+        if output_attentions:
+            attn_probs = {"global": global_attn_probs, "local": local_attn_probs}
+        else:
+            attn_probs = None
+
+        return local_attn_output, global_attn_output, attn_probs
+
+    def compute_global_attention_representations(
+        self, global_q, global_k, global_v, local_k, local_v, mask, dim: DimensionInfo
+    ):
+        """Compute attention representations for global tokens.
+
+        Global tokens will attend to both global tokens as well as all input sequence tokens. Because the input
+        sequence tokens are arranged in blocks for local attention, we unblock them and compute attention.
+
+        Args:
+            global_q (`torch.FloatTensor`) of shape [batch_size, num_heads, global_len, dim_per_head]:
+                query vectors from global tokens
+            global_k (`torch.FloatTensor`) of shape [batch_size, num_heads, global_len, dim_per_head]:
+                key vectors from global tokens
+            global_v (`torch.FloatTensor`) of shape [batch_size, num_heads, global_len, dim_per_head]:
+                value vectors from global tokens
+            local_k (`torch.FloatTensor`) of shape [batch_size, num_heads, padded_seq_len, dim_per_head]:
+                key vectors from local tokens
+            local_v (`torch.FloatTensor`) of shape [batch_size, num_heads, padded_seq_len, dim_per_head]:
+                value vectors from local tokens
+            mask (`torch.FloatTensor`) of shape [batch_size, padded_seq_len]: attention mask
+            dim (DimensionInfo): DimensionInfo wrapper for dimensions
+
+        Returns:
+            output of shape `[batch_sizes, length, features]`. where length will be padded to a multiple of block_size
+        """
+        # [batch_size, num_heads, global_len+padded_seq_len, dim_per_head]
+        global_and_local_k = torch.cat([global_k, local_k], dim=2)
+        # [batch_size, num_heads, global_len+padded_seq_len, dim_per_head]
+        global_and_local_v = torch.cat([global_v, local_v], dim=2)
+
+        # [batch_size, global_len+padded_seq_len]
+        extended_mask = nn.functional.pad(mask, pad=(dim.global_len, 0), value=0)
+
+        # [batch_size, num_heads, global_len, global_len+padded_seq_len]
+        attn_weights = torch.einsum("BHGF,BHXF->BHGX", global_q, global_and_local_k)
+        attn_weights = attn_weights + extended_mask[:, None, None, :]
+        attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+        attn_probs = nn.functional.dropout(attn_probs, p=self.dropout, training=self.training)
+
+        # [batch_size, num_heads, global_len, F]
+        attn_output = torch.einsum("BHGX,BHXF->BHGF", attn_probs, global_and_local_v)
+        return attn_output, attn_probs
+
+    def compute_local_attention_representations(
+        self, global_k, global_v, local_q, local_k, local_v, mask, dim: DimensionInfo
+    ):
+        """Compute attention representations for local tokens.
+
+        Local tokens will attend to both global tokens as well as all other tokens within the same local block. Hence,
+        we need to tile and concatenate the global tokens to every local block
+
+        Args:
+            global_k (`torch.FloatTensor`) of shape [batch_size, num_heads, global_len, dim_per_head]:
+                key vectors from global tokens
+            global_v (`torch.FloatTensor`) of shape [batch_size, num_heads, global_len, dim_per_head]:
+                value vectors from global tokens
+            local_q (`torch.FloatTensor`) of shape [batch_size, num_heads, padded_seq_len, dim_per_head]:
+                query vectors from local tokens
+            local_k (`torch.FloatTensor`) of shape [batch_size, num_heads, padded_seq_len, dim_per_head]:
+                key vectors from local tokens
+            local_v (`torch.FloatTensor`) of shape [batch_size, num_heads, padded_seq_len, dim_per_head]:
+                value vectors from local tokens
+            mask (`torch.FloatTensor`) of shape [batch_size, padded_seq_len]: attention mask
+            dim (DimensionInfo): DimensionInfo wrapper for dimensions
+
+        Returns:
+            output of shape `[batch_sizes, length, features]`. where length will be padded to a multiple of block_size
+        """
+        # [batch_size, num_heads, num_blocks, block_size, dim_per_head]
+        blocked_local_q = local_q.view(dim.batch_size, dim.num_heads, dim.num_blocks, dim.block_size, dim.dim_per_head)
+        # [batch_size, num_heads, num_blocks, block_size, dim_per_head]
+        blocked_local_k = local_k.view(dim.batch_size, dim.num_heads, dim.num_blocks, dim.block_size, dim.dim_per_head)
+        # [batch_size, num_heads, num_blocks, block_size, dim_per_head]
+        blocked_local_v = local_v.view(dim.batch_size, dim.num_heads, dim.num_blocks, dim.block_size, dim.dim_per_head)
+
+        # [batch_size, num_blocks, global_len+block_size]
+        extended_mask = nn.functional.pad(
+            mask.view(dim.batch_size, dim.num_blocks, dim.block_size),
+            pad=(dim.global_len, 0),
+            value=0,
+        )
+
+        # [batch_size, num_heads, num_blocks, block_size, global_len]
+        blocked_local2global = torch.einsum("BHNKF,BHGF->BHNKG", blocked_local_q, global_k)
+        # [batch_size, num_heads, num_blocks, block_size, block_size]
+        blocked_local2local = torch.einsum("BHNKF,BHNXF->BHNKX", blocked_local_q, blocked_local_k)
+
+        # [batch_size, num_heads, num_blocks, block_size, global_len+block_size]
+        attn_weights = torch.cat([blocked_local2global, blocked_local2local], dim=-1)
+        attn_weights = attn_weights + extended_mask[:, None, :, None, :]
+        attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+        attn_probs = nn.functional.dropout(attn_probs, p=self.dropout, training=self.training)
+
+        # [batch_size, num_heads, num_blocks, block_size, global_len]
+        local2global_attn_probs = attn_probs[:, :, :, :, : dim.global_len]
+        # [batch_size, num_heads, num_blocks, block_size, block_size]
+        local2local_attn_probs = attn_probs[:, :, :, :, dim.global_len :]
+
+        # [batch_size, num_heads, num_blocks, block_size, dim_per_head]
+        local2global_attn_output = torch.einsum("BHNKG,BHGF->BHNKF", local2global_attn_probs, global_v)
+        # [batch_size, num_heads, num_blocks, block_size, dim_per_head]
+        local2local_attn_output = torch.einsum("BHNKX,BHNXF->BHNKF", local2local_attn_probs, blocked_local_v)
+        # [batch_size, num_heads, num_blocks, block_size, dim_per_head]
+        attn_output = local2global_attn_output + local2local_attn_output
+        return attn_output, attn_probs
+
+
+class PegasusXEncoderLayer(nn.Module):
+    def __init__(self, stagger_blocks_this_layer: bool, config: PegasusXConfig):
         super().__init__()
         self.embed_dim = config.d_model
-        self.self_attn = PegasusAttention(
+        self.self_attn = PegasusXGlobalLocalAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
+            block_size=config.block_size,
             dropout=config.attention_dropout,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.global_self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
         self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
         self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.stagger_blocks_this_layer = stagger_blocks_this_layer
+        self.block_size = config.block_size
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        global_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        layer_head_mask: torch.Tensor,
         output_attentions: bool = False,
     ) -> torch.Tensor:
         """
         Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(seq_len, batch, embed_dim)`
+            hidden_states (`torch.FloatTensor`): input to the layer of shape *(seq_len, batch, embed_dim)*
+            global_hidden_states (`torch.FloatTensor`): global token hidden states
+                *(seq_len, num_global_tokens, embed_dim)*
             attention_mask (`torch.FloatTensor`): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            layer_head_mask (`torch.FloatTensor`): mask for attention heads in a given layer of size
-                `(encoder_attention_heads,)`.
+                *(batch, 1, tgt_len, src_len)* where padding elements are indicated by very large negative values.
             output_attentions (`bool`, *optional*):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
         residual = hidden_states
+        global_residual = global_hidden_states
+
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states, attn_weights, _ = self.self_attn(
-            hidden_states=hidden_states,
+        global_hidden_states = self.global_self_attn_layer_norm(global_hidden_states)
+
+        if self.stagger_blocks_this_layer:
+            # Pad the blocks to simulate staggering
+            hidden_states, attention_mask = self.pad_local_tokens(
+                hidden_states=hidden_states, attention_mask=attention_mask, block_size=self.block_size
+            )
+
+        hidden_states, global_hidden_states, attn_weights = self.self_attn(
+            token_hidden_states=hidden_states,
+            global_hidden_states=global_hidden_states,
             attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
         )
+
+        if self.stagger_blocks_this_layer:
+            # Undo the padding
+            hidden_states = self.unpad_local_tokens(padded_hidden_states=hidden_states, block_size=self.block_size)
+
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
+
+        global_hidden_states = nn.functional.dropout(global_hidden_states, p=self.dropout, training=self.training)
+        global_hidden_states = global_residual + global_hidden_states
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -417,42 +662,68 @@ class PegasusEncoderLayer(nn.Module):
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
-        if hidden_states.dtype == torch.float16 and (
-            torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
-        ):
-            clamp_value = torch.finfo(hidden_states.dtype).max - 1000
-            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
-
-        outputs = (hidden_states,)
+        global_residual = global_hidden_states
+        global_hidden_states = self.final_layer_norm(global_hidden_states)
+        global_hidden_states = self.activation_fn(self.fc1(global_hidden_states))
+        global_hidden_states = nn.functional.dropout(
+            global_hidden_states, p=self.activation_dropout, training=self.training
+        )
+        global_hidden_states = self.fc2(global_hidden_states)
+        global_hidden_states = nn.functional.dropout(global_hidden_states, p=self.dropout, training=self.training)
+        global_hidden_states = global_residual + global_hidden_states
+        outputs = (hidden_states, global_hidden_states)
 
         if output_attentions:
             outputs += (attn_weights,)
 
         return outputs
 
+    @classmethod
+    def pad_local_tokens(cls, hidden_states, attention_mask, block_size):
+        # hidden_states: [batch_size, seq_len, hidden_dim]
+        pad_size = block_size // 2
+        mask_min_value = torch.finfo(hidden_states.dtype).min
+        padded_hidden_states = torch.nn.functional.pad(
+            hidden_states,
+            pad=(0, 0, pad_size, pad_size),
+        )
+        padded_mask = torch.nn.functional.pad(
+            attention_mask,
+            pad=(pad_size, pad_size),
+            value=mask_min_value,
+        )
+        return padded_hidden_states, padded_mask
 
-# Copied from transformers.models.mbart.modeling_mbart.MBartDecoderLayer with MBart->Pegasus
-class PegasusDecoderLayer(nn.Module):
-    def __init__(self, config: PegasusConfig):
+    @classmethod
+    def unpad_local_tokens(cls, padded_hidden_states, block_size):
+        # padded_hidden_states: [batch_size, padded seq_len, hidden_dim]
+        pad_size = block_size // 2
+        return padded_hidden_states[:, pad_size:-pad_size, :]
+
+
+class PegasusXDecoderLayer(nn.Module):
+    def __init__(self, config: PegasusXConfig):
         super().__init__()
         self.embed_dim = config.d_model
 
-        self.self_attn = PegasusAttention(
+        self.self_attn = PegasusXAttention(
             embed_dim=self.embed_dim,
             num_heads=config.decoder_attention_heads,
             dropout=config.attention_dropout,
             is_decoder=True,
+            bias=False,
         )
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
 
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.encoder_attn = PegasusAttention(
+        self.encoder_attn = PegasusXAttention(
             self.embed_dim,
             config.decoder_attention_heads,
             dropout=config.attention_dropout,
             is_decoder=True,
+            bias=False,
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.fc1 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)
@@ -465,29 +736,24 @@ class PegasusDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        layer_head_mask: Optional[torch.Tensor] = None,
-        cross_attn_layer_head_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
     ) -> torch.Tensor:
         """
         Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            hidden_states (`torch.FloatTensor`): input to the layer of shape *(seq_len, batch, embed_dim)*
             attention_mask (`torch.FloatTensor`): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+                *(batch, 1, tgt_len, src_len)* where padding elements are indicated by very large negative values.
             encoder_hidden_states (`torch.FloatTensor`):
-                cross attention input to the layer of shape `(batch, seq_len, embed_dim)`
+                cross attention input to the layer of shape *(seq_len, batch, embed_dim)*
             encoder_attention_mask (`torch.FloatTensor`): encoder attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            layer_head_mask (`torch.FloatTensor`): mask for attention heads in a given layer of size
-                `(encoder_attention_heads,)`.
-            cross_attn_layer_head_mask (`torch.FloatTensor`): mask for cross-attention heads in a given layer of
-                size `(decoder_attention_heads,)`.
+                *(batch, 1, tgt_len, src_len)* where padding elements are indicated by very large negative values.
             past_key_value (`Tuple(torch.FloatTensor)`): cached past key and value projection states
             output_attentions (`bool`, *optional*):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
+            use_cache: Whether to us KV cache for decoding
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -500,7 +766,6 @@ class PegasusDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             past_key_value=self_attn_past_key_value,
             attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
@@ -519,7 +784,6 @@ class PegasusDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 key_value_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
-                layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=cross_attn_past_key_value,
                 output_attentions=output_attentions,
             )
@@ -549,8 +813,8 @@ class PegasusDecoderLayer(nn.Module):
         return outputs
 
 
-class PegasusPreTrainedModel(PreTrainedModel):
-    config_class = PegasusConfig
+class PegasusXPreTrainedModel(PreTrainedModel):
+    config_class = PegasusXConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
 
@@ -560,19 +824,15 @@ class PegasusPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, PegasusSinusoidalPositionalEmbedding):
-            pass
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
 
     def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, (PegasusDecoder, PegasusEncoder)):
+        if isinstance(module, (PegasusXDecoder, PegasusXEncoder)):
             module.gradient_checkpointing = value
 
 
-PEGASUS_START_DOCSTRING = r"""
+PEGASUS_X_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
@@ -582,20 +842,20 @@ PEGASUS_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`PegasusConfig`]):
+        config ([`PegasusXConfig`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
 """
 
-PEGASUS_GENERATION_EXAMPLE = r"""
+PEGASUS_X_GENERATION_EXAMPLE = r"""
     Summarization example:
 
     ```python
-    >>> from transformers import AutoTokenizer, PegasusForConditionalGeneration
+    >>> from transformers import AutoTokenizer, PegasusXForConditionalGeneration
 
-    >>> model = PegasusForConditionalGeneration.from_pretrained("google/pegasus-xsum")
-    >>> tokenizer = AutoTokenizer.from_pretrained("google/pegasus-xsum")
+    >>> model = PegasusXForConditionalGeneration.from_pretrained("google/pegasus-x-base")
+    >>> tokenizer = AutoTokenizer.from_pretrained("google/pegasus-x-large")
 
     >>> ARTICLE_TO_SUMMARIZE = (
     ...     "PG&E stated it scheduled the blackouts in response to forecasts for high winds "
@@ -611,7 +871,7 @@ PEGASUS_GENERATION_EXAMPLE = r"""
     ```
 """
 
-PEGASUS_INPUTS_DOCSTRING = r"""
+PEGASUS_X_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
@@ -621,6 +881,8 @@ PEGASUS_INPUTS_DOCSTRING = r"""
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
+        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
         attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
             Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
 
@@ -636,30 +898,12 @@ PEGASUS_INPUTS_DOCSTRING = r"""
 
             [What are decoder input IDs?](../glossary#decoder-input-ids)
 
-            Pegasus uses the `pad_token_id` as the starting token for `decoder_input_ids` generation. If
+            PEGASUS-X uses the `pad_token_id` as the starting token for `decoder_input_ids` generation. If
             `past_key_values` is used, optionally only the last `decoder_input_ids` have to be input (see
             `past_key_values`).
         decoder_attention_mask (`torch.LongTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
             Default behavior: generate a tensor that ignores pad tokens in `decoder_input_ids`. Causal mask will also
             be used by default.
-        head_mask (`torch.Tensor` of shape `(encoder_layers, encoder_attention_heads)`, *optional*):
-            Mask to nullify selected heads of the attention modules in the encoder. Mask values selected in `[0, 1]`:
-
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-
-        decoder_head_mask (`torch.Tensor` of shape `(decoder_layers, decoder_attention_heads)`, *optional*):
-            Mask to nullify selected heads of the attention modules in the decoder. Mask values selected in `[0, 1]`:
-
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
-
-        cross_attn_head_mask (`torch.Tensor` of shape `(decoder_layers, decoder_attention_heads)`, *optional*):
-            Mask to nullify selected heads of the cross-attention modules in the decoder. Mask values selected in `[0,
-            1]`:
-
-            - 1 indicates the head is **not masked**,
-            - 0 indicates the head is **masked**.
 
         encoder_outputs (`tuple(tuple(torch.FloatTensor)`, *optional*):
             Tuple consists of (`last_hidden_state`, *optional*: `hidden_states`, *optional*: `attentions`)
@@ -701,46 +945,42 @@ PEGASUS_INPUTS_DOCSTRING = r"""
 """
 
 
-class PegasusEncoder(PegasusPreTrainedModel):
+class PegasusXEncoder(PegasusXPreTrainedModel):
     """
     Transformer encoder consisting of *config.encoder_layers* self attention layers. Each layer is a
-    [`PegasusEncoderLayer`].
+    [`PegasusXEncoderLayer`].
 
     Args:
-        config: PegasusConfig
+        config: PegasusXConfig
         embed_tokens (nn.Embedding): output embedding
     """
 
-    def __init__(self, config: PegasusConfig, embed_tokens: Optional[nn.Embedding] = None):
+    def __init__(self, config: PegasusXConfig, embed_tokens: Optional[nn.Embedding] = None):
         super().__init__(config)
 
         self.dropout = config.dropout
         self.layerdrop = config.encoder_layerdrop
 
         embed_dim = config.d_model
-        self.padding_idx = config.pad_token_id
         self.max_source_positions = config.max_position_embeddings
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
 
         if embed_tokens is not None:
             self.embed_tokens = embed_tokens
         else:
-            self.embed_tokens = nn.Embedding(config.vocab_size, embed_dim, self.padding_idx)
+            self.embed_tokens = nn.Embedding(config.vocab_size, embed_dim)
 
-        self.embed_positions = PegasusSinusoidalPositionalEmbedding(
-            config.max_position_embeddings,
-            embed_dim,
-            self.padding_idx,
+        self.embed_global = nn.Embedding(config.num_global_tokens, embed_dim)
+        self.embed_positions = PegasusXSinusoidalPositionalEmbedding(embed_dim)
+        self.layers = nn.ModuleList(
+            [
+                PegasusXEncoderLayer(
+                    stagger_blocks_this_layer=i % 2 == 1 and config.stagger_local_blocks, config=config
+                )
+                for i in range(config.encoder_layers)
+            ]
         )
-        self.layers = nn.ModuleList([PegasusEncoderLayer(config) for _ in range(config.encoder_layers)])
         self.layer_norm = nn.LayerNorm(config.d_model)
-
-        self.encoder_topk_layer = config.encoder_topk_layer
-        self.top_p = config.top_p
-        self.n_samples = config.n_samples
-        self.sigma = config.sigma
-        self.topk_inference = config.topk_inference
-        self.annotator_classifier = nn.Linear(config.hidden_size, 1)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -762,11 +1002,7 @@ class PegasusEncoder(PegasusPreTrainedModel):
         logger.info(f"Setting `config.max_position_embeddings={new_num_position_embeddings}`...")
         self.config.max_position_embeddings = new_num_position_embeddings
 
-        self.embed_positions = PegasusSinusoidalPositionalEmbedding(
-            self.config.max_position_embeddings,
-            self.config.d_model,
-            self.padding_idx,
-        )
+        self.embed_positions = PegasusXSinusoidalPositionalEmbedding(self.config.d_model)
         self.embed_positions.to(self.device)
 
     def get_position_embeddings(self) -> nn.Embedding:
@@ -779,7 +1015,6 @@ class PegasusEncoder(PegasusPreTrainedModel):
         self,
         input_ids=None,
         attention_mask=None,
-        head_mask=None,
         inputs_embeds=None,
         output_attentions=None,
         output_hidden_states=None,
@@ -802,11 +1037,6 @@ class PegasusEncoder(PegasusPreTrainedModel):
                 - 0 for tokens that are **masked**.
 
                 [What are attention masks?](../glossary#attention-mask)
-            head_mask (`torch.Tensor` of shape `(encoder_layers, encoder_attention_heads)`, *optional*):
-                Mask to nullify selected heads of the attention modules. Mask values selected in `[0, 1]`:
-
-                - 1 indicates the head is **not masked**,
-                - 0 indicates the head is **masked**.
 
             inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
                 Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
@@ -841,27 +1071,38 @@ class PegasusEncoder(PegasusPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
 
-        embed_pos = self.embed_positions(input_shape)
+        embed_pos = self.embed_positions(inputs_embeds)
 
         hidden_states = inputs_embeds + embed_pos
-
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
-        # expand attention_mask
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            attention_mask = _expand_mask(attention_mask, inputs_embeds.dtype)
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # Setup mask
+        if attention_mask is None:
+            attention_mask = torch.ones(*input_shape, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+        mask_min_value = torch.finfo(hidden_states.dtype).min
+        inverted_mask = 1.0 - attention_mask
+        attention_mask = inverted_mask.masked_fill(
+            inverted_mask.to(torch.bool),
+            mask_min_value,
+        )
+
+        # padding to block_size
+        if seq_len % self.config.block_size != 0:
+            pad_len = self.config.block_size - seq_len % self.config.block_size
+            hidden_states = nn.functional.pad(hidden_states, pad=(0, 0, 0, pad_len), value=0)
+            attention_mask = nn.functional.pad(attention_mask, pad=(0, pad_len), value=mask_min_value)
+
+        # Global tokens
+        global_hidden_states = self.embed_global(
+            torch.arange(self.config.num_global_tokens, device=hidden_states.device)[None].expand(batch_size, -1)
+        )
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        # check if head_mask has a correct number of layers specified if desired
-        if head_mask is not None:
-            if head_mask.size()[0] != len(self.layers):
-                raise ValueError(
-                    f"The head_mask should be specified for {len(self.layers)} layers, but it is for"
-                    f" {head_mask.size()[0]}."
-                )
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
@@ -870,12 +1111,8 @@ class PegasusEncoder(PegasusPreTrainedModel):
             if self.training and (dropout_probability < self.layerdrop):  # skip the layer
                 layer_outputs = (None, None)
             else:
-
-                if self.encoder_topk_layer == idx:
-                    hidden_states = compute_topk_hidden_states(self, hidden_states, attention_mask.size(-1))
-
                 if self.gradient_checkpointing and self.training:
-            
+
                     def create_custom_forward(module):
                         def custom_forward(*inputs):
                             return module(*inputs, output_attentions)
@@ -885,26 +1122,30 @@ class PegasusEncoder(PegasusPreTrainedModel):
                     layer_outputs = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(encoder_layer),
                         hidden_states,
-                        None,
-                        (head_mask[idx] if head_mask is not None else None),
+                        global_hidden_states,
+                        attention_mask,
                     )
                 else:
                     layer_outputs = encoder_layer(
                         hidden_states,
-                        attention_mask=None,
-                        layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                        global_hidden_states,
+                        attention_mask,
                         output_attentions=output_attentions,
                     )
 
                 hidden_states = layer_outputs[0]
+                global_hidden_states = layer_outputs[1]
 
             if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
+                all_attentions = all_attentions + (layer_outputs[2],)
+
+        # Undo padding-to-block-size
+        hidden_states = hidden_states[:, :seq_len]
 
         hidden_states = self.layer_norm(hidden_states)
 
         if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
+            encoder_states = encoder_states + ((hidden_states, global_hidden_states),)
 
         if not return_dict:
             return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
@@ -913,34 +1154,29 @@ class PegasusEncoder(PegasusPreTrainedModel):
         )
 
 
-class PegasusDecoder(PegasusPreTrainedModel):
+class PegasusXDecoder(PegasusXPreTrainedModel):
     """
     Transformer decoder consisting of *config.decoder_layers* layers. Each layer is a [`PegasusDecoderLayer`]
 
     Args:
-        config: PegasusConfig
+        config: PegasusXConfig
         embed_tokens (nn.Embedding): output embedding
     """
 
-    def __init__(self, config: PegasusConfig, embed_tokens: Optional[nn.Embedding] = None):
+    def __init__(self, config: PegasusXConfig, embed_tokens: Optional[nn.Embedding] = None):
         super().__init__(config)
         self.dropout = config.dropout
         self.layerdrop = config.decoder_layerdrop
-        self.padding_idx = config.pad_token_id
         self.max_target_positions = config.max_position_embeddings
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
 
         if embed_tokens is not None:
             self.embed_tokens = embed_tokens
         else:
-            self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model, self.padding_idx)
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
 
-        self.embed_positions = PegasusSinusoidalPositionalEmbedding(
-            config.max_position_embeddings,
-            config.d_model,
-            self.padding_idx,
-        )
-        self.layers = nn.ModuleList([PegasusDecoderLayer(config) for _ in range(config.decoder_layers)])
+        self.embed_positions = PegasusXSinusoidalPositionalEmbedding(config.d_model)
+        self.layers = nn.ModuleList([PegasusXDecoderLayer(config) for _ in range(config.decoder_layers)])
         self.layer_norm = nn.LayerNorm(config.d_model)
 
         self.gradient_checkpointing = False
@@ -993,11 +1229,7 @@ class PegasusDecoder(PegasusPreTrainedModel):
         logger.info(f"Setting `config.max_position_embeddings={new_num_position_embeddings}`...")
         self.config.max_position_embeddings = new_num_position_embeddings
 
-        self.embed_positions = PegasusSinusoidalPositionalEmbedding(
-            self.config.max_position_embeddings,
-            self.config.d_model,
-            self.padding_idx,
-        )
+        self.embed_positions = PegasusXSinusoidalPositionalEmbedding(self.config.d_model)
         self.embed_positions.to(self.device)
 
     def get_position_embeddings(self) -> nn.Embedding:
@@ -1012,8 +1244,6 @@ class PegasusDecoder(PegasusPreTrainedModel):
         attention_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
-        head_mask=None,
-        cross_attn_head_mask=None,
         past_key_values=None,
         inputs_embeds=None,
         use_cache=None,
@@ -1049,18 +1279,6 @@ class PegasusDecoder(PegasusPreTrainedModel):
                 - 0 for tokens that are **masked**.
 
                 [What are attention masks?](../glossary#attention-mask)
-            head_mask (`torch.Tensor` of shape `(decoder_layers, decoder_attention_heads)`, *optional*):
-                Mask to nullify selected heads of the attention modules. Mask values selected in `[0, 1]`:
-
-                - 1 indicates the head is **not masked**,
-                - 0 indicates the head is **masked**.
-
-            cross_attn_head_mask (`torch.Tensor` of shape `(decoder_layers, decoder_attention_heads)`, *optional*):
-                Mask to nullify selected heads of the cross-attention modules in decoder to avoid performing
-                cross-attention on hidden heads. Mask values selected in `[0, 1]`:
-
-                - 1 indicates the head is **not masked**,
-                - 0 indicates the head is **masked**.
 
             past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
                 Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
@@ -1072,7 +1290,8 @@ class PegasusDecoder(PegasusPreTrainedModel):
 
                 If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those
                 that don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of
-                all `decoder_input_ids` of shape `(batch_size, sequence_length)`. inputs_embeds (`torch.FloatTensor` of
+                all `decoder_input_ids` of shape `(batch_size, sequence_length)`.
+            inputs_embeds (`torch.FloatTensor` of
                 shape `(batch_size, sequence_length, hidden_size)`, *optional*): Optionally, instead of passing
                 `input_ids` you can choose to directly pass an embedded representation. This is useful if you want more
                 control over how to convert `input_ids` indices into associated vectors than the model's internal
@@ -1120,7 +1339,7 @@ class PegasusDecoder(PegasusPreTrainedModel):
             encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
         # embed positions
-        positions = self.embed_positions(input_shape, past_key_values_length)
+        positions = self.embed_positions(inputs_embeds, past_key_values_length)
 
         hidden_states = inputs_embeds + positions
 
@@ -1139,14 +1358,6 @@ class PegasusDecoder(PegasusPreTrainedModel):
         all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
         next_decoder_cache = () if use_cache else None
 
-        # check if head_mask/cross_attn_head_mask has a correct number of layers specified if desired
-        for attn_mask, mask_name in zip([head_mask, cross_attn_head_mask], ["head_mask", "cross_attn_head_mask"]):
-            if attn_mask is not None:
-                if attn_mask.size()[0] != len(self.layers):
-                    raise ValueError(
-                        f"The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for"
-                        f" {head_mask.size()[0]}."
-                    )
         for idx, decoder_layer in enumerate(self.layers):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
@@ -1172,8 +1383,6 @@ class PegasusDecoder(PegasusPreTrainedModel):
                     attention_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
-                    head_mask[idx] if head_mask is not None else None,
-                    cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
                     None,
                 )
             else:
@@ -1182,10 +1391,6 @@ class PegasusDecoder(PegasusPreTrainedModel):
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
-                    layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                    cross_attn_layer_head_mask=(
-                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
-                    ),
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
@@ -1224,26 +1429,26 @@ class PegasusDecoder(PegasusPreTrainedModel):
 
 
 @add_start_docstrings(
-    "The bare PEGASUS Model outputting raw hidden-states without any specific head on top.",
-    PEGASUS_START_DOCSTRING,
+    "The bare PEGASUS-X Model outputting raw hidden-states without any specific head on top.",
+    PEGASUS_X_START_DOCSTRING,
 )
-class PegasusModel(PegasusPreTrainedModel):
-    _keys_to_ignore_on_load_missing = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
+class PegasusXModel(PegasusXPreTrainedModel):
+    _keys_to_ignore_on_load_missing = ["decoder.embed_tokens.weight", "encoder.embed_tokens.weight"]
 
-    def __init__(self, config: PegasusConfig):
+    def __init__(self, config: PegasusXConfig):
         super().__init__(config)
 
-        padding_idx, vocab_size = config.pad_token_id, config.vocab_size
-        self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
+        vocab_size = config.vocab_size
+        self.shared = nn.Embedding(vocab_size, config.d_model)
         self.top_p = config.top_p
         self.n_samples = config.n_samples
         self.sigma = config.sigma
         self.topk_inference = config.topk_inference
 
-        self.encoder = PegasusEncoder(config, self.shared)
-        self.decoder = PegasusDecoder(config, self.shared)
+        self.encoder = PegasusXEncoder(config, self.shared)
+        self.decoder = PegasusXDecoder(config, self.shared)
 
-        # self.annotator_classifier = nn.Linear(config.hidden_size, 1)
+        self.annotator_classifier = nn.Linear(config.hidden_size, 1)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1285,7 +1490,7 @@ class PegasusModel(PegasusPreTrainedModel):
         """
         return (self.encoder.get_position_embeddings(), self.decoder.get_position_embeddings())
 
-    @add_start_docstrings_to_model_forward(PEGASUS_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(PEGASUS_X_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=Seq2SeqModelOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -1293,9 +1498,6 @@ class PegasusModel(PegasusPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        decoder_head_mask: Optional[torch.Tensor] = None,
-        cross_attn_head_mask: Optional[torch.Tensor] = None,
         encoder_outputs: Optional[Tuple[torch.FloatTensor]] = None,
         past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1313,8 +1515,8 @@ class PegasusModel(PegasusPreTrainedModel):
         ```python
         >>> from transformers import AutoTokenizer, PegasusModel
 
-        >>> tokenizer = AutoTokenizer.from_pretrained("google/pegasus-large")
-        >>> model = PegasusModel.from_pretrained("google/pegasus-large")
+        >>> tokenizer = AutoTokenizer.from_pretrained("google/pegasus-x-large")
+        >>> model = PegasusModel.from_pretrained("google/pegasus-x-large")
 
         >>> inputs = tokenizer("Studies have been shown that owning a dog is good for you", return_tensors="pt")
         >>> decoder_inputs = tokenizer("Studies show that", return_tensors="pt")
@@ -1336,13 +1538,11 @@ class PegasusModel(PegasusPreTrainedModel):
             encoder_outputs = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                head_mask=head_mask,
                 inputs_embeds=inputs_embeds,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
-        
         # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
             encoder_outputs = BaseModelOutput(
@@ -1350,17 +1550,30 @@ class PegasusModel(PegasusPreTrainedModel):
                 hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
-
-        # topk_encoder_outputs = compute_topk_hidden_states(self, encoder_outputs[0], attention_mask.size(-1))
+        
+        token_relevance = self.annotator_classifier(encoder_outputs[0])
+        k = int(self.top_p * attention_mask.size(-1))
+        
+        if self.topk_inference == "perturbated":
+            indicators = PerturbedTopKFunction.apply(token_relevance.squeeze(-1), k, self.sigma, self.n_samples)
+            topk_encoder_outputs = torch.einsum("b k d, b d c -> b k c", indicators, encoder_outputs[0])
+        elif self.topk_inference == "hard":
+            if self.training:        
+                indicators = PerturbedTopKFunction.apply(token_relevance.squeeze(-1), k, self.sigma, self.n_samples)
+                topk_encoder_outputs = torch.einsum("b k n, b n d -> b k d", indicators, encoder_outputs[0])
+            else:
+                _, indices = torch.topk(token_relevance.squeeze(-1), k=k, dim=-1, sorted=False)
+                indices = torch.sort(indices, dim=-1).values
+                indicators = F.one_hot(indices)
+                indicators = F.pad(indicators, pad=(0, attention_mask.size(-1) - indicators.size(-1), 0, 0))
+                topk_encoder_outputs = torch.einsum("b k n, b n d -> b k d", indicators.float(), encoder_outputs[0])
         
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
-            encoder_hidden_states=encoder_outputs[0],
+            encoder_hidden_states=topk_encoder_outputs,
             # encoder_attention_mask=attention_mask,
-            head_mask=decoder_head_mask,
-            cross_attn_head_mask=cross_attn_head_mask,
             past_key_values=past_key_values,
             inputs_embeds=decoder_inputs_embeds,
             use_cache=use_cache,
@@ -1384,25 +1597,21 @@ class PegasusModel(PegasusPreTrainedModel):
         )
 
 
-@add_start_docstrings(
-    "The PEGASUS Model with a language modeling head. Can be used for summarization.", PEGASUS_START_DOCSTRING
-)
-class PegasusForConditionalGeneration(PegasusPreTrainedModel):
+@add_start_docstrings("The PEGASUS-X for conditional generation (e.g. summarization).", PEGASUS_X_START_DOCSTRING)
+class PegasusXForConditionalGeneration(PegasusXPreTrainedModel):
     base_model_prefix = "model"
     _keys_to_ignore_on_load_missing = [
-        r"final_logits_bias",
         r"encoder.version",
         r"decoder.version",
         r"lm_head.weight",
         r"embed_positions.weight",
-        "encoder.embed_tokens.weight",
         "decoder.embed_tokens.weight",
+        "encoder.embed_tokens.weight",
     ]
 
-    def __init__(self, config: PegasusConfig):
+    def __init__(self, config: PegasusXConfig):
         super().__init__(config)
-        self.model = PegasusModel(config)
-        self.register_buffer("final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings)))
+        self.model = PegasusXModel(config)
         self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
 
         # Initialize weights and apply final processing
@@ -1416,17 +1625,7 @@ class PegasusForConditionalGeneration(PegasusPreTrainedModel):
 
     def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
         new_embeddings = super().resize_token_embeddings(new_num_tokens)
-        self._resize_final_logits_bias(new_num_tokens)
         return new_embeddings
-
-    def _resize_final_logits_bias(self, new_num_tokens: int) -> None:
-        old_num_tokens = self.final_logits_bias.shape[-1]
-        if new_num_tokens <= old_num_tokens:
-            new_bias = self.final_logits_bias[:, :new_num_tokens]
-        else:
-            extra_bias = torch.zeros((1, new_num_tokens - old_num_tokens), device=self.final_logits_bias.device)
-            new_bias = torch.cat([self.final_logits_bias, extra_bias], dim=1)
-        self.register_buffer("final_logits_bias", new_bias)
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -1457,18 +1656,15 @@ class PegasusForConditionalGeneration(PegasusPreTrainedModel):
         """
         return (self.model.encoder.get_position_embeddings(), self.model.decoder.get_position_embeddings())
 
-    @add_start_docstrings_to_model_forward(PEGASUS_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(PEGASUS_X_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=Seq2SeqLMOutput, config_class=_CONFIG_FOR_DOC)
-    @add_end_docstrings(PEGASUS_GENERATION_EXAMPLE)
+    @add_end_docstrings(PEGASUS_X_GENERATION_EXAMPLE)
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        decoder_head_mask: Optional[torch.Tensor] = None,
-        cross_attn_head_mask: Optional[torch.Tensor] = None,
         encoder_outputs: Optional[Tuple[torch.FloatTensor]] = None,
         past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -1505,9 +1701,6 @@ class PegasusForConditionalGeneration(PegasusPreTrainedModel):
             decoder_input_ids=decoder_input_ids,
             encoder_outputs=encoder_outputs,
             decoder_attention_mask=decoder_attention_mask,
-            head_mask=head_mask,
-            decoder_head_mask=decoder_head_mask,
-            cross_attn_head_mask=cross_attn_head_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             decoder_inputs_embeds=decoder_inputs_embeds,
@@ -1516,7 +1709,7 @@ class PegasusForConditionalGeneration(PegasusPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
+        lm_logits = self.lm_head(outputs[0])
 
         masked_lm_loss = None
         if labels is not None:
@@ -1544,9 +1737,6 @@ class PegasusForConditionalGeneration(PegasusPreTrainedModel):
         decoder_input_ids,
         past_key_values=None,
         attention_mask=None,
-        head_mask=None,
-        decoder_head_mask=None,
-        cross_attn_head_mask=None,
         use_cache=None,
         encoder_outputs=None,
         **kwargs,
@@ -1561,9 +1751,6 @@ class PegasusForConditionalGeneration(PegasusPreTrainedModel):
             "past_key_values": past_key_values,
             "decoder_input_ids": decoder_input_ids,
             "attention_mask": attention_mask,
-            "head_mask": head_mask,
-            "decoder_head_mask": decoder_head_mask,
-            "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
         }
 
@@ -1581,8 +1768,8 @@ class PegasusForConditionalGeneration(PegasusPreTrainedModel):
         return reordered_past
 
 
-# Copied from transformers.models.bart.modeling_bart.BartDecoderWrapper with Bart->Pegasus
-class PegasusDecoderWrapper(PegasusPreTrainedModel):
+# Copied from transformers.models.bart.modeling_bart.BartDecoderWrapper with Bart->PegasusX
+class PegasusXDecoderWrapper(PegasusXPreTrainedModel):
     """
     This wrapper class is a helper class to correctly load pretrained checkpoints when the causal language model is
     used in combination with the [`EncoderDecoderModel`] framework.
@@ -1590,233 +1777,7 @@ class PegasusDecoderWrapper(PegasusPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.decoder = PegasusDecoder(config)
+        self.decoder = PegasusXDecoder(config)
 
     def forward(self, *args, **kwargs):
         return self.decoder(*args, **kwargs)
-
-
-class PegasusForCausalLM(PegasusPreTrainedModel):
-    _keys_to_ignore_on_load_missing = ["lm_head.weight"]
-
-    def __init__(self, config):
-        config = copy.deepcopy(config)
-        config.is_decoder = True
-        config.is_encoder_decoder = False
-        super().__init__(config)
-        self.model = PegasusDecoderWrapper(config)
-
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.decoder.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.decoder.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    def set_decoder(self, decoder):
-        self.model.decoder = decoder
-
-    def get_decoder(self):
-        return self.model.decoder
-
-    def get_position_embeddings(self) -> nn.Embedding:
-        """
-        Returns the position embeddings matrix
-        """
-        return self.model.decoder.get_position_embeddings()
-
-    def resize_position_embeddings(self, new_num_position_embeddings: int):
-        """
-        Resizes position embeddings matrix of the model if `new_num_position_embeddings !=
-        config.max_position_embeddings`.
-
-        Arguments:
-            new_num_position_embeddings (`int`):
-                The number of new position embeddings. If position embeddings are learned, increasing the size will add
-                newly initialized vectors at the end, whereas reducing the size will remove vectors from the end. If
-                position embeddings are not learned (*e.g.* sinusoidal position embeddings), increasing the size will
-                add correct vectors at the end following the position encoding algorithm, whereas reducing the size
-                will remove vectors from the end.
-        """
-        self.config.max_position_embeddings = new_num_position_embeddings
-        self.model.decoder.resize_position_embeddings(new_num_position_embeddings)
-
-    @replace_return_docstrings(output_type=CausalLMOutputWithCrossAttentions, config_class=_CONFIG_FOR_DOC)
-    # Copied from transformers.models.bart.modeling_bart.BartForCausalLM.forward with Bart->Pegasus, facebook/bart-base->google/pegasus-large
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        cross_attn_head_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithCrossAttentions]:
-        r"""
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
-                provide it.
-
-                Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-                [`PreTrainedTokenizer.__call__`] for details.
-
-                [What are input IDs?](../glossary#input-ids)
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-                [What are attention masks?](../glossary#attention-mask)
-            encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-                Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention
-                if the model is configured as a decoder.
-            encoder_attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used
-                in the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
-            head_mask (`torch.Tensor` of shape `(decoder_layers, decoder_attention_heads)`, *optional*):
-                Mask to nullify selected heads of the attention modules. Mask values selected in `[0, 1]`:
-
-                - 1 indicates the head is **not masked**,
-                - 0 indicates the head is **masked**.
-
-            cross_attn_head_mask (`torch.Tensor` of shape `(decoder_layers, decoder_attention_heads)`, *optional*):
-                Mask to nullify selected heads of the cross-attention modules. Mask values selected in `[0, 1]`:
-
-                - 1 indicates the head is **not masked**,
-                - 0 indicates the head is **masked**.
-
-            past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-                Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
-                shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of
-                shape `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`. The two additional
-                tensors are only required when the model is used as a decoder in a Sequence to Sequence model.
-
-                Contains pre-computed hidden-states (key and values in the self-attention blocks and in the
-                cross-attention blocks) that can be used (see `past_key_values` input) to speed up sequential decoding.
-
-                If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those
-                that don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of
-                all `decoder_input_ids` of shape `(batch_size, sequence_length)`.
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
-                for more detail.
-            return_dict (`bool`, *optional*):
-                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, PegasusForCausalLM
-
-        >>> tokenizer = AutoTokenizer.from_pretrained("google/pegasus-large")
-        >>> model = PegasusForCausalLM.from_pretrained("google/pegasus-large", add_cross_attention=False)
-        >>> assert model.config.is_decoder, f"{model.__class__} has to be configured as a decoder."
-        >>> inputs = tokenizer("Hello, my dog is cute", return_tensors="pt")
-        >>> outputs = model(**inputs)
-
-        >>> logits = outputs.logits
-        >>> expected_shape = [1, inputs.input_ids.shape[-1], model.config.vocab_size]
-        >>> list(logits.shape) == expected_shape
-        True
-        ```"""
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model.decoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            head_mask=head_mask,
-            cross_attn_head_mask=cross_attn_head_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        logits = self.lm_head(outputs[0])
-
-        loss = None
-        if labels is not None:
-            labels = labels.to(logits.device)
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
-
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-
-        return CausalLMOutputWithCrossAttentions(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            cross_attentions=outputs.cross_attentions,
-        )
-
-    def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, use_cache=None, **kwargs
-    ):
-        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
-        if attention_mask is None:
-            attention_mask = input_ids.new_ones(input_ids.shape)
-
-        if past_key_values:
-            input_ids = input_ids[:, -1:]
-        # first step, decoder_cached_states are empty
-        return {
-            "input_ids": input_ids,  # encoder_outputs is defined. input_ids not needed
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
-            "use_cache": use_cache,
-        }
-
-    @staticmethod
-    def _reorder_cache(past_key_values, beam_idx):
-        reordered_past = ()
-        for layer_past in past_key_values:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
-        return reordered_past

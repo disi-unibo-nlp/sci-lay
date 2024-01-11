@@ -38,9 +38,11 @@ from utils import predict
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
-from src.models.modeling_ledtopk import DledDearWatsonForConditionalGeneration
+from src.models.modeling_led_topk import DledDearWatsonForConditionalGeneration
 from src.models.modeling_pegasus_topk import PegasusForConditionalGeneration
 from src.models.modeling_bart_topk import BartForConditionalGeneration
+from src.models.modeling_pegasus_x_topk import PegasusXForConditionalGeneration
+
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.30.0.dev0")
@@ -307,6 +309,10 @@ class ModelArguments:
         default=10,
         metadata={"help": "Number of samples for topk token selection."},
     )
+    encoder_topk_layer: int = field(
+        default=None,
+        metadata={"help": "Encoder layer where topk token selection is applied."},
+    )
     sigma: float = field(
         default=0.1,
         metadata={"help": "Sigma for topk token selection."},
@@ -424,6 +430,7 @@ def main():
         config.sigma = model_args.sigma
         config.topk_inference = model_args.topk_inference
         config.decr_sigma = model_args.decr_sigma
+        config.encoder_topk_layer = model_args.encoder_topk_layer
         model = PegasusForConditionalGeneration.from_pretrained(model_args.model_name_or_path, config=config)
     else:
         model = AutoModelForSeq2SeqLM.from_pretrained(model_args.model_name_or_path)
