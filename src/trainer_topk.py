@@ -473,8 +473,8 @@ class TrainerE2E(Trainer):
                     # AT THE VERY END!
                     _ = list(train_dataloader.sampler)
 
-        if hasattr(model.model, 'sigma'):
-            init_sigma = model.model.sigma
+        if hasattr(model.model.encoder, 'sigma'):
+            init_sigma = model.model.encoder.sigma
 
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
@@ -504,9 +504,9 @@ class TrainerE2E(Trainer):
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
-                if hasattr(model.model, 'sigma'):
+                if hasattr(model.model.encoder, 'sigma'):
                     if model.model.config.decr_sigma:
-                        model.model.sigma =  init_sigma * (1 - self.state.global_step/self.state.max_steps)
+                        model.model.encoder.sigma =  init_sigma * (1 - self.state.global_step/self.state.max_steps)
 
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:

@@ -105,7 +105,7 @@ class PerturbedTopKFunction(torch.autograd.Function):
 def compute_topk_hidden_states(self, hidden_states, n_tokens):
     token_relevance = self.annotator_classifier(hidden_states)
     k = int(self.top_p * n_tokens)
-    
+
     if self.topk_inference == "perturbated":
         indicators = PerturbedTopKFunction.apply(token_relevance.squeeze(-1), k, self.sigma, self.n_samples)
         topk_encoder_outputs = torch.einsum("b k d, b d c -> b k c", indicators, hidden_states)
@@ -1237,7 +1237,6 @@ class PegasusModel(PegasusPreTrainedModel):
         self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
         self.top_p = config.top_p
         self.n_samples = config.n_samples
-        self.sigma = config.sigma
         self.topk_inference = config.topk_inference
 
         self.encoder = PegasusEncoder(config, self.shared)
