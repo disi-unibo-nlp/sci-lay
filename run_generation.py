@@ -325,6 +325,15 @@ class ModelArguments:
         default=False,
         metadata={"help": "Decrease sigma for topk token selection."},
     )
+    mult_layers_topk: bool = field(
+        default=False,
+        metadata={"help": "Apply topk token selection to all layers."},
+    )
+    num_topk_layers: int = field(
+        default=4,
+        metadata={"help": "Number of layers to apply topk token selection."},
+    )
+    
 
 
 
@@ -431,6 +440,8 @@ def main():
         config.topk_inference = model_args.topk_inference
         config.decr_sigma = model_args.decr_sigma
         config.encoder_topk_layer = model_args.encoder_topk_layer
+        config.mult_layers_topk = model_args.mult_layers_topk
+        config.num_topk_layers = model_args.num_topk_layers
         model = PegasusForConditionalGeneration.from_pretrained(model_args.model_name_or_path, config=config)
     else:
         model = AutoModelForSeq2SeqLM.from_pretrained(model_args.model_name_or_path)

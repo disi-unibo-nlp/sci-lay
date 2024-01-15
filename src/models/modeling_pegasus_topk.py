@@ -102,8 +102,7 @@ class PerturbedTopKFunction(torch.autograd.Function):
         return (grad_input,) + tuple([None] * 5)
 
 
-def compute_topk_hidden_states(self, hidden_states, n_tokens):
-    token_relevance = self.annotator_classifier(hidden_states)
+def compute_topk_hidden_states(self, hidden_states, token_relevance, n_tokens):
     k = int(self.top_p * n_tokens)
 
     if self.topk_inference == "perturbated":
@@ -736,11 +735,18 @@ class PegasusEncoder(PegasusPreTrainedModel):
         self.layer_norm = nn.LayerNorm(config.d_model)
 
         self.encoder_topk_layer = config.encoder_topk_layer
+        self.mult_layers_topk = config.mult_layers_topk
         self.top_p = config.top_p
         self.n_samples = config.n_samples
         self.sigma = config.sigma
         self.topk_inference = config.topk_inference
         self.annotator_classifier = nn.Linear(config.hidden_size, 1)
+
+        if self.mult_layers_topk:
+            self.num_topk_layers = config.num_topk_layers
+            self.annotator_classifiers = nn.ModuleList([nn.Linear(config.hidden_size, 1) for _ in range(self.num_topk_layers)])
+        else:
+            self.annotator_classifier = nn.Linear(config.hidden_size, 1)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -862,6 +868,8 @@ class PegasusEncoder(PegasusPreTrainedModel):
                     f"The head_mask should be specified for {len(self.layers)} layers, but it is for"
                     f" {head_mask.size()[0]}."
                 )
+        
+        topk_idx = 0
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
@@ -871,8 +879,15 @@ class PegasusEncoder(PegasusPreTrainedModel):
                 layer_outputs = (None, None)
             else:
 
-                if self.encoder_topk_layer == idx:
-                    hidden_states = compute_topk_hidden_states(self, hidden_states, attention_mask.size(-1))
+                n_tokens = hidden_states.size(1)
+                
+                if self.mult_layers_topk and idx%self.num_topk_layers==0:
+                    token_relevance = self.annotator_classifiers[topk_idx](hidden_states)
+                    hidden_states = compute_topk_hidden_states(self, hidden_states, token_relevance, n_tokens)
+                    topk_idx += 1
+                elif self.encoder_topk_layer == idx:
+                    token_relevance = self.annotator_classifier(hidden_states)             
+                    hidden_states = compute_topk_hidden_states(self, hidden_states, token_relevance, n_tokens)
 
                 if self.gradient_checkpointing and self.training:
             
