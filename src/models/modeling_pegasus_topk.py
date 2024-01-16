@@ -740,7 +740,6 @@ class PegasusEncoder(PegasusPreTrainedModel):
         self.n_samples = config.n_samples
         self.sigma = config.sigma
         self.topk_inference = config.topk_inference
-        self.annotator_classifier = nn.Linear(config.hidden_size, 1)
 
         if self.mult_layers_topk:
             self.num_topk_layers = config.num_topk_layers
@@ -881,7 +880,7 @@ class PegasusEncoder(PegasusPreTrainedModel):
 
                 n_tokens = hidden_states.size(1)
                 
-                if self.mult_layers_topk and idx%self.num_topk_layers==0:
+                if self.mult_layers_topk and (idx + 1)%self.num_topk_layers==0:
                     token_relevance = self.annotator_classifiers[topk_idx](hidden_states)
                     hidden_states = compute_topk_hidden_states(self, hidden_states, token_relevance, n_tokens)
                     topk_idx += 1
