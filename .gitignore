@@ -1,6 +1,7 @@
 output*
 wandb
 remove.py
+test_jax.py
 .lock
 __pycache__/
 *.sh
