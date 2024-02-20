@@ -38,7 +38,7 @@ from utils import predict
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
-from src.models.modeling_led_topk import DledDearWatsonForConditionalGeneration
+from src.models.modeling_led_topk import LEDForConditionalGeneration
 from src.models.modeling_pegasus_topk import PegasusForConditionalGeneration
 from src.models.modeling_bart_topk import BartForConditionalGeneration
 from src.models.modeling_pegasus_x_topk import PegasusXForConditionalGeneration
@@ -61,7 +61,7 @@ except (LookupError, OSError):
 global_rouge_scorer = rouge.Rouge(metrics=['rouge-n', 'rouge-l', 'rouge-w'],
                             max_n=4,
                             limit_length=True,
-                            length_limit=100,
+                            length_limit=500,
                             length_limit_type='words',
                             apply_avg=True,
                             apply_best=False,
@@ -97,6 +97,10 @@ class DataTrainingArguments:
     target_column: Optional[str] = field(
         default="plain_text",
         metadata={"help": "The name of the column in the datasets containing the summaries (for summarization)."},
+    )
+    new_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "The name of the new directory to save the output."},
     )
     train_file: Optional[str] = field(
         default=None, metadata={"help": "The input training data file (a jsonlines or csv file)."}
@@ -194,6 +198,23 @@ class DataTrainingArguments:
             "help": (
                 "Number of beams to use for evaluation. This argument will be passed to ``model.generate``, "
                 "which is used during ``evaluate`` and ``test``."
+            )
+        },
+    )
+    no_repeat_ngram_size: Optional[int] = field(
+        default=1,
+        metadata={
+            "help": (
+                "no_repeat_ngram_size to use for evaluation. This argument will be passed to ``model.generate``, "
+                "which is used during ``evaluate`` and ``test``."
+            )
+        },
+    )
+    min_length: Optional[int] = field(
+        default=0,
+        metadata={
+            "help": (
+                "min_length to use for evaluation. This argument will be passed to ``model.generate``, "
             )
         },
     )
@@ -309,6 +330,10 @@ class ModelArguments:
         default=10,
         metadata={"help": "Number of samples for topk token selection."},
     )
+    ncls_layers: int = field(
+        default=0,
+        metadata={"help": "Number of self-attention layers to apply topk token selection."},
+    )
     encoder_topk_layer: int = field(
         default=None,
         metadata={"help": "Encoder layer where topk token selection is applied."},
@@ -325,6 +350,14 @@ class ModelArguments:
         default=False,
         metadata={"help": "Decrease sigma for topk token selection."},
     )
+    decr_top_p: bool = field(
+        default=False,
+        metadata={"help": "Decrease top_p for topk token selection."},
+    )
+    r: bool = field(
+        default=False,
+        metadata={"help": "Decrease top_p for topk token selection."},
+    )
     mult_layers_topk: bool = field(
         default=False,
         metadata={"help": "Apply topk token selection to all layers."},
@@ -332,6 +365,18 @@ class ModelArguments:
     num_topk_layers: int = field(
         default=4,
         metadata={"help": "Number of layers to apply topk token selection."},
+    )
+    save_indicators: bool = field(
+        default=False,
+        metadata={"help": "Save indicators of topk token selection."},
+    )
+    save_scores: bool = field(
+        default=False,
+        metadata={"help": "Save scorws of topk token selection."},
+    )
+    use_attention: bool = field(
+        default=False,
+        metadata={"help": "Use attention for topk token selection."},
     )
     
 
@@ -348,6 +393,8 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     training_args.do_test = training_args.do_predict
+    training_args.new_dir = training_args.output_dir + "/" + data_args.new_dir if data_args.new_dir is not None else None
+
     training_args.output_dir += "/" + training_args.run_name
     # assert not os.path.exists(training_args.output_dir), "Output directory already exists"
 
@@ -439,10 +486,18 @@ def main():
         config.sigma = model_args.sigma
         config.topk_inference = model_args.topk_inference
         config.decr_sigma = model_args.decr_sigma
+        config.decr_top_p = model_args.decr_top_p
         config.encoder_topk_layer = model_args.encoder_topk_layer
         config.mult_layers_topk = model_args.mult_layers_topk
         config.num_topk_layers = model_args.num_topk_layers
-        model = PegasusForConditionalGeneration.from_pretrained(model_args.model_name_or_path, config=config)
+        config.save_indicators = model_args.save_indicators
+        config.use_attention = model_args.use_attention
+        config.ncls_layers = model_args.ncls_layers
+        config.save_scores = model_args.save_scores
+        if "pegasus" in model_args.model_name_or_path:
+            model = PegasusForConditionalGeneration.from_pretrained(model_args.model_name_or_path, config=config)
+        else:
+            model = LEDForConditionalGeneration.from_pretrained(model_args.model_name_or_path, config=config)
     else:
         model = AutoModelForSeq2SeqLM.from_pretrained(model_args.model_name_or_path)
     
@@ -506,8 +561,19 @@ def main():
         )
 
     def preprocess_function(examples):
+        if data_args.target_column == "combined":
+            inputs = examples[data_args.input_column]
+            targets = ["[PLAIN] " + plain + " [TECHNICAL] " + technical
+                      for plain, technical in zip(examples["plain_text"], examples["technical_text"])]
+        elif data_args.dataset_name == "tomasg25/scientific_lay_summarisation":
+            inputs = ["".join(example.split()[1:]) for example in examples[data_args.input_column]]
+            targets = ["".join(example.split()[0]) for example in examples[data_args.input_column]]
+        else:
+            inputs, targets = examples[data_args.input_column], examples[data_args.target_column]
 
-        inputs, targets = examples[data_args.input_column], examples[data_args.target_column]
+        if data_args.target_column == "keywords":
+            targets = ["; ".join(target) for target in targets]
+
         model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
 
         # Tokenize targets with the `text_target` keyword argument
@@ -679,7 +745,8 @@ def main():
     training_args.generation_num_beams = (
         data_args.num_beams if data_args.num_beams is not None else training_args.generation_num_beams
     )
-
+    training_args.no_repeat_ngram_size = data_args.no_repeat_ngram_size
+    training_args.min_length = data_args.min_length
 
     # Initialize our Trainer
     trainer = Seq2SeqTrainer(

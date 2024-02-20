@@ -1,17 +1,40 @@
+import sys
+sys.path.append('./')
+
+import warnings
+
+# Suppress all warnings
+warnings.filterwarnings("ignore")
+
 import torch
 import rouge
 import json
+import nltk
 import argparse
 import evaluate
+import numpy as np
 from tqdm import tqdm
+from evaluation.compute_readability import print_read
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+# from bleurt import score as bleurt_scorer
 from statistics import mean
 from datasets import load_dataset
+# from moverscore_folder.moverscore_v2 import get_idf_dict, word_mover_score 
 from BARTScore.bart_score import BARTScorer
+from readability import Readability
+from datasets import load_dataset
+
+METRICS = ["fkgl", "cli", "gf", "dcrs"]
+
+
+
+
 
 global_rouge_scorer = rouge.Rouge(metrics=['rouge-n', 'rouge-l', 'rouge-w'],
                                   max_n=4,
                                   limit_length=True,
-                                  length_limit=100,
+                                  length_limit=500,
                                   length_limit_type='words',
                                   apply_avg=True,
                                   apply_best=False,
@@ -20,17 +43,7 @@ global_rouge_scorer = rouge.Rouge(metrics=['rouge-n', 'rouge-l', 'rouge-w'],
                                   stemming=True)
 
 
-def main():
-    split_dataset = load_dataset(args.dataset_name, args.dataset_subset)[args.split]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    bart_scorer = BARTScorer(device=device, checkpoint='facebook/bart-large-cnn')
-    metric_bertscore = evaluate.load("bertscore")
-
-    with open(f'{args.output_dir}/{args.model}/generated_{args.split}_set.json', 'r') as file:
-        data = json.load(file)
-    
-    full_targets = [target for target in split_dataset[args.target_column]]
-    full_predictions = [pred['prediction'] for pred in data]
+def evaluate_by_journal(split_dataset, full_targets, full_predictions, bart_scorer, metric_bertscore):
     data_dict = {}
     journals = set(split_dataset['journal'])
     for i, journal in enumerate(split_dataset['journal']):
@@ -100,6 +113,75 @@ def main():
     with open(f'{args.output_dir}/{args.model}/journals_results.txt', 'w') as file:
         file.write(full_output_string)
 
+
+def remove_stopwords(text):
+    # Tokenize the text
+    words = word_tokenize(text)
+    # Remove stopwords
+    filtered_words = [word for word in words if word.lower() not in stopwords.words('english')]
+
+    # Join the filtered words to form a sentence
+    filtered_text = ' '.join(filtered_words)
+
+    return filtered_text
+
+def main():
+    split_dataset = load_dataset(args.dataset_name, args.dataset_subset)[args.split]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    bart_scorer = BARTScorer(device=device, checkpoint='facebook/bart-large-cnn')
+    metric_bertscore = evaluate.load("bertscore")
+    metric_rouge = evaluate.load("rouge")
+
+    with open(f'{args.output_dir}/{args.model}/generated_{args.split}_set.json', 'r') as file:
+        data = json.load(file)
+    
+    full_targets = [target for target in split_dataset[args.output_dir.split("output_")[1]]]
+    full_predictions = [pred['prediction'] for pred in data]
+
+    if args.remove_stopwords:
+        full_targets = [remove_stopwords(target) for target in full_targets]
+        full_predictions = [remove_stopwords(pred) for pred in full_predictions]
+
+    if args.by_journal:
+        evaluate_by_journal(split_dataset, full_targets, full_predictions, bart_scorer, metric_bertscore)
+    else:
+        result = {}
+        """
+        # MoverScore
+        idf_dict_ref = get_idf_dict(full_targets)
+        idf_dict_hyp = get_idf_dict(full_predictions)
+        with open('moverscore_folder/examples/stopwords.txt', 'r', encoding='utf-8') as f:
+            stop_words = set(f.read().strip().split(' '))
+        scores = word_mover_score(full_targets, full_predictions, idf_dict_ref, idf_dict_hyp, \
+                          stop_words=stop_words, n_gram=1, remove_subwords=True, batch_size=10)
+        result["moverscore"] = np.mean(scores)
+        """
+        """
+        # Bleurt
+        scorer = bleurt_scorer.BleurtScorer()
+        scores = scorer.score(references=full_targets, candidates=full_predictions)
+        result["bleurt"] = np.mean(scores)
+        
+        # BertScore
+        result_bs = metric_bertscore.compute(predictions=full_predictions, references=full_targets, lang="en",
+                                                idf=True, rescale_with_baseline=True,
+                                                model_type="distilbert-base-uncased")
+        
+        result["bertscore_pubmed"] = round(sum(result_bs["f1"]) / len(result_bs["f1"]) * 100, 2)
+        result = metric_rouge.compute(predictions=full_predictions, references=full_targets)
+        
+        rouge_scores = global_rouge_scorer.get_scores(references=full_targets, hypothesis=full_predictions)
+        result["rouge-1"] = rouge_scores["rouge-1"]["f"]
+        result["rouge-2"] = rouge_scores["rouge-2"]["f"]
+        result["rouge-l"] = rouge_scores["rouge-l"]["f"]
+             
+        print(result)
+        """
+
+        full_predictions = " ".join(full_predictions)
+        print_read(full_predictions)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train transformer to classify relevant tokens in dialog summarization"
@@ -125,14 +207,19 @@ if __name__ == "__main__":
         type=str,
     )
     parser.add_argument(
-        "--target_column",
-        default="plain_text",
+        "--output_dir",
+        default="output_plain_text",
         type=str,
     )
     parser.add_argument(
-        "--output_dir",
-        default="output",
-        type=str,
+        "--by_journal",
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
+        "--remove_stopwords",
+        default=False,
+        action="store_true",
     )
     args = parser.parse_args()
 

@@ -14,7 +14,7 @@ from nltk.translate.bleu_score import corpus_bleu
 global_rouge_scorer = rouge.Rouge(metrics=['rouge-n', 'rouge-l', 'rouge-w'],
                             max_n=4,
                             limit_length=True,
-                            length_limit=100,
+                            length_limit=500,
                             length_limit_type='words',
                             apply_avg=True,
                             apply_best=False,
@@ -73,8 +73,14 @@ def predict(trainer, predict_dataset, max_predict_samples, training_args, tokeni
                 output_dict = {"prediction": pred}
                 list_output_dict.append(output_dict)
 
-            output_prediction_file = os.path.join(training_args.output_dir, f"generated_{split}_set.json")
+            if training_args.new_dir is not None:
+                if not os.path.exists(training_args.new_dir):
+                    os.makedirs(training_args.new_dir)
+                output_prediction_file = os.path.join(training_args.new_dir, f"generated_{split}_set.json")
+            else:
+                output_prediction_file = os.path.join(training_args.output_dir, f"generated_{split}_set.json")
             
+
             with open(output_prediction_file, 'w') as json_file:
                 json.dump(list_output_dict, json_file, indent=4) 
 

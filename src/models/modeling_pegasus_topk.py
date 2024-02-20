@@ -24,11 +24,11 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 from torch.nn import CrossEntropyLoss
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
-    BaseModelOutput,
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
     Seq2SeqLMOutput,
@@ -41,6 +41,7 @@ from transformers.utils import (
     add_start_docstrings_to_model_forward,
     logging,
     replace_return_docstrings,
+    ModelOutput,
 )
 from transformers.models.pegasus.configuration_pegasus import PegasusConfig
 
@@ -55,6 +56,13 @@ PEGASUS_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "google/pegasus-large",
     # See all PEGASUS models at https://huggingface.co/models?filter=pegasus
 ]
+
+def zerooneeps_fn(scores):
+    scores_min = torch.min(scores)
+    scores_max = torch.max(scores)
+
+    return torch.div(scores - scores_min, scores_max - scores_min + 1e-5)
+
 
 
 class PerturbedTopKFunction(torch.autograd.Function):
@@ -106,20 +114,21 @@ def compute_topk_hidden_states(self, hidden_states, token_relevance, n_tokens):
     k = int(self.top_p * n_tokens)
 
     if self.topk_inference == "perturbated":
-        indicators = PerturbedTopKFunction.apply(token_relevance.squeeze(-1), k, self.sigma, self.n_samples)
+        indicators = PerturbedTopKFunction.apply(token_relevance, k, self.sigma, self.n_samples)
         topk_encoder_outputs = torch.einsum("b k d, b d c -> b k c", indicators, hidden_states)
     elif self.topk_inference == "hard":
         if self.training:        
-            indicators = PerturbedTopKFunction.apply(token_relevance.squeeze(-1), k, self.sigma, self.n_samples)
+            indicators = PerturbedTopKFunction.apply(token_relevance, k, self.sigma, self.n_samples)
             topk_encoder_outputs = torch.einsum("b k n, b n d -> b k d", indicators, hidden_states)
         else:
-            _, indices = torch.topk(token_relevance.squeeze(-1), k=k, dim=-1, sorted=False)
+            _, indices = torch.topk(token_relevance, k=k, dim=-1, sorted=False)
             indices = torch.sort(indices, dim=-1).values
             indicators = F.one_hot(indices)
             indicators = F.pad(indicators, pad=(0, n_tokens - indicators.size(-1), 0, 0))
+            # import pickle; pickle.dump(indicators.cpu(), open("indicators.pkl", "wb"))
             topk_encoder_outputs = torch.einsum("b k n, b n d -> b k d", indicators.float(), hidden_states)
 
-    return topk_encoder_outputs
+    return topk_encoder_outputs, indicators.cpu()
 
 # Copied from transformers.models.bart.modeling_bart.shift_tokens_right
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
@@ -169,6 +178,33 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     inverted_mask = 1.0 - expanded_mask
 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+
+
+@dataclass
+class BaseModelOutput(ModelOutput):
+    """
+    Base class for model's outputs, with potential hidden states and attentions.
+
+    Args:
+        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the model.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    last_hidden_state: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    indicators: Optional[torch.FloatTensor] = None
 
 
 # Copied from transformers.models.marian.modeling_marian.MarianSinusoidalPositionalEmbedding with Marian->Pegasus
@@ -740,11 +776,16 @@ class PegasusEncoder(PegasusPreTrainedModel):
         self.n_samples = config.n_samples
         self.sigma = config.sigma
         self.topk_inference = config.topk_inference
+        self.use_attention = config.use_attention
+        self.save_scores = config.save_scores
 
         if self.mult_layers_topk:
             self.num_topk_layers = config.num_topk_layers
             self.annotator_classifiers = nn.ModuleList([nn.Linear(config.hidden_size, 1) for _ in range(self.num_topk_layers)])
         else:
+            self.cls_layers = nn.ModuleList()
+            for k in range(config.ncls_layers):
+                self.cls_layers.append(PegasusEncoderLayer(config))
             self.annotator_classifier = nn.Linear(config.hidden_size, 1)
 
         self.gradient_checkpointing = False
@@ -881,18 +922,37 @@ class PegasusEncoder(PegasusPreTrainedModel):
                 n_tokens = hidden_states.size(1)
                 
                 if self.mult_layers_topk and (idx + 1)%self.num_topk_layers==0:
-                    token_relevance = self.annotator_classifiers[topk_idx](hidden_states)
-                    hidden_states = compute_topk_hidden_states(self, hidden_states, token_relevance, n_tokens)
+                    if self.use_attention:
+                        token_relevance = torch.mean(layer_outputs[1].squeeze(), dim=(1))
+                        token_relevance = torch.mean(token_relevance, dim=(0)).unsqueeze(0)
+                    else:
+                        token_relevance = self.annotator_classifiers[topk_idx](hidden_states)
+                        token_relevance = token_relevance.squeeze(-1)
+                    hidden_states, indicators = compute_topk_hidden_states(self, hidden_states, token_relevance, n_tokens)
                     topk_idx += 1
                 elif self.encoder_topk_layer == idx:
-                    token_relevance = self.annotator_classifier(hidden_states)             
-                    hidden_states = compute_topk_hidden_states(self, hidden_states, token_relevance, n_tokens)
+                    
+                    if self.use_attention:
+                        token_relevance = torch.mean(layer_outputs[1].squeeze(), dim=(1))
+                        token_relevance = torch.mean(token_relevance, dim=(0)).unsqueeze(0)
+                    else:
+                        for cls_layer in self.cls_layers:
+                            hidden_states = cls_layer(hidden_states, attention_mask=None, layer_head_mask=None)[0]
+                        token_relevance = self.annotator_classifier(hidden_states)
+                        token_relevance = token_relevance.squeeze(-1)
+                        if self.save_scores:
+                            attn_tensor = torch.mean(layer_outputs[1].squeeze(), dim=(1))
+                            attn_tensor = torch.mean(attn_tensor, dim=(0))
+                            self.average_attn_scores = attn_tensor.cpu().detach().tolist()
+                            self.scorer_scores = token_relevance.squeeze(0).cpu().detach().tolist()
+
+                    hidden_states, indicators = compute_topk_hidden_states(self, hidden_states, token_relevance, n_tokens)
 
                 if self.gradient_checkpointing and self.training:
             
                     def create_custom_forward(module):
                         def custom_forward(*inputs):
-                            return module(*inputs, output_attentions)
+                            return module(*inputs, True) #self.use_attention
 
                         return custom_forward
 
@@ -907,9 +967,9 @@ class PegasusEncoder(PegasusPreTrainedModel):
                         hidden_states,
                         attention_mask=None,
                         layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                        output_attentions=output_attentions,
+                        output_attentions=True, #self.use_attention
                     )
-
+                
                 hidden_states = layer_outputs[0]
 
             if output_attentions:
@@ -923,7 +983,8 @@ class PegasusEncoder(PegasusPreTrainedModel):
         if not return_dict:
             return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
         return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
+            last_hidden_state=hidden_states, hidden_states=encoder_states,
+            attentions=all_attentions, indicators=indicators,
         )
 
 
@@ -1253,6 +1314,8 @@ class PegasusModel(PegasusPreTrainedModel):
         self.n_samples = config.n_samples
         self.topk_inference = config.topk_inference
 
+        self.save_indicators = config.save_indicators
+
         self.encoder = PegasusEncoder(config, self.shared)
         self.decoder = PegasusDecoder(config, self.shared)
 
@@ -1363,6 +1426,9 @@ class PegasusModel(PegasusPreTrainedModel):
                 hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
+        
+        if len(encoder_outputs) == 2 and self.save_indicators:
+            self.indicators = encoder_outputs[1]
 
         # topk_encoder_outputs = compute_topk_hidden_states(self, encoder_outputs[0], attention_mask.size(-1))
         

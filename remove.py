@@ -28,10 +28,9 @@ def remove_folder(folder_path):
         print(f"Error: {folder_path} : {e.strerror}")
 
 
-
 def main():
     # Specify the path for which you want to retrieve the folder list
-    path = "output_technical_text"
+    path = "output"
 
     folder_list = get_folders_in_path(path)
 

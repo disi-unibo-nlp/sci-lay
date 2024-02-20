@@ -1,7 +1,10 @@
 output*
 wandb
+remove.py
 .lock
 __pycache__/
 *.sh
 BARTScore/
 sparse_soft_topk/
+moverscore/
+evaluation/cache/

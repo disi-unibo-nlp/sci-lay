@@ -1,3 +1,6 @@
+import sys
+sys.path.append('./')
+
 # coding=utf-8
 # Copyright 2020-present the HuggingFace Inc. team.
 #
@@ -43,7 +46,7 @@ from torch import nn
 from torch.utils.data import Dataset
 
 from transformers.generation.configuration_utils import GenerationConfig
-from transformers.trainer import Trainer
+from src.trainer import Trainer
 from transformers.utils import logging
 
 
@@ -473,8 +476,29 @@ class TrainerE2E(Trainer):
                     # AT THE VERY END!
                     _ = list(train_dataloader.sampler)
 
-        if hasattr(model.model.encoder, 'sigma'):
-            init_sigma = model.model.encoder.sigma
+        if hasattr(model, "model"):
+            if hasattr(model.model.encoder, 'sigma'):
+                init_sigma = model.model.encoder.sigma
+            if hasattr(model.model.encoder, 'top_p'):
+                target_top_p = model.model.encoder.top_p
+                thresholds_and_values = [
+                            (1000, 0.9),
+                            (1500, 0.8),
+                            (2000, 0.7),
+                            (2500, 0.6)
+                        ]
+                # top_p_step_size = (init_top_p - target_top_p) / self.state.max_steps
+        elif hasattr(model, "led"):
+            if hasattr(model.led.encoder, 'sigma'):
+                init_sigma = model.led.encoder.sigma
+            if hasattr(model.led.encoder, 'top_p'):
+                target_top_p = model.led.encoder.top_p
+                thresholds_and_values = [
+                            (1000, 0.9),
+                            (1500, 0.8),
+                            (2000, 0.7),
+                            (2500, 0.6)
+                        ]
 
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
@@ -503,11 +527,27 @@ class TrainerE2E(Trainer):
                 self._load_rng_state(resume_from_checkpoint)
 
             step = -1
+            forward_times = []
+            backward_times = []
             for step, inputs in enumerate(epoch_iterator):
-                if hasattr(model.model.encoder, 'sigma'):
-                    if model.model.config.decr_sigma:
-                        model.model.encoder.sigma =  init_sigma * (1 - self.state.global_step/self.state.max_steps)
+                if hasattr(model, "model"):
+                    if hasattr(model.model.encoder, 'sigma'):
+                        if model.model.config.decr_sigma:
+                            model.model.encoder.sigma =  init_sigma * (1 - self.state.global_step/self.state.max_steps)
+                    if hasattr(model.model.encoder, 'top_p'):
+                        if model.model.config.decr_top_p:
+                            model.model.encoder.top_p = next((top_p for threshold, top_p in thresholds_and_values if step < threshold),
+                                        target_top_p)  
+                elif hasattr(model, "led"):
+                    if hasattr(model.led.encoder, 'sigma'):
+                        if model.led.config.decr_sigma:
+                            model.led.encoder.sigma =  init_sigma * (1 - self.state.global_step/self.state.max_steps)
+                    if hasattr(model.led.encoder, 'top_p'):
+                        if model.led.config.decr_top_p:
+                            model.led.encoder.top_p = next((top_p for threshold, top_p in thresholds_and_values if step < threshold),
+                                        target_top_p)  
 
+                                            
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
@@ -530,10 +570,12 @@ class TrainerE2E(Trainer):
                 ):
                     # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
                     with model.no_sync():
-                        tr_loss_step = self.training_step(model, inputs)
+                        tr_loss_step, forward_time, backward_time = self.training_step(model, inputs)
                 else:
-                    tr_loss_step = self.training_step(model, inputs)
+                    tr_loss_step, forward_time, backward_time = self.training_step(model, inputs)
 
+                forward_times.append(forward_time)
+                backward_times.append(backward_time)
                 if (
                     args.logging_nan_inf_filter
                     and not is_torch_tpu_available()
@@ -610,7 +652,10 @@ class TrainerE2E(Trainer):
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
-                
+
+            print("Average forward time: ", sum(forward_times) / len(forward_times))
+            print("Average backward time: ", sum(backward_times) / len(backward_times))
+    
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
@@ -676,7 +721,7 @@ class TrainerE2E(Trainer):
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
-
+    
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
@@ -818,6 +863,8 @@ class Seq2SeqTrainer(TrainerE2E):
         gen_kwargs["num_beams"] = (
             gen_kwargs["num_beams"] if gen_kwargs.get("num_beams") is not None else self.args.generation_num_beams
         )
+        gen_kwargs["no_repeat_ngram_size"] = self.args.no_repeat_ngram_size
+        gen_kwargs["min_length"] = self.args.min_length
         self._gen_kwargs = gen_kwargs
 
         return super().evaluate(eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
@@ -875,6 +922,8 @@ class Seq2SeqTrainer(TrainerE2E):
         gen_kwargs["num_beams"] = (
             gen_kwargs["num_beams"] if gen_kwargs.get("num_beams") is not None else self.args.generation_num_beams
         )
+        gen_kwargs["no_repeat_ngram_size"] = self.args.no_repeat_ngram_size
+        gen_kwargs["min_length"] = self.args.min_length
         self._gen_kwargs = gen_kwargs
 
         return super().predict(test_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
@@ -913,7 +962,9 @@ class Seq2SeqTrainer(TrainerE2E):
             )
 
         has_labels = "labels" in inputs
+        # import pickle; pickle.dump(inputs["input_ids"], open('inputs.pkl', 'wb'))
         inputs = self._prepare_inputs(inputs)
+        
 
         # XXX: adapt synced_gpus for fairscale as well
         # Priority (handled in generate):
