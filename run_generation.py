@@ -34,7 +34,7 @@ from transformers import (
 
 from src.trainer_topk import Seq2SeqTrainer
 from nltk.translate.bleu_score import corpus_bleu
-from utils import predict
+from utils import predict, preprocess_function
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -354,10 +354,6 @@ class ModelArguments:
         default=False,
         metadata={"help": "Decrease top_p for topk token selection."},
     )
-    r: bool = field(
-        default=False,
-        metadata={"help": "Decrease top_p for topk token selection."},
-    )
     mult_layers_topk: bool = field(
         default=False,
         metadata={"help": "Apply topk token selection to all layers."},
@@ -548,46 +544,11 @@ def main():
         logger.info("There is nothing to do. Please pass `do_train`, `do_val` and/or `do_test`.")
         return
 
-    
-    
-    # Temporarily set max_target_length for training.
-    max_target_length = data_args.max_target_length
-    padding = "max_length" if data_args.pad_to_max_length else False
-
     if training_args.label_smoothing_factor > 0 and not hasattr(model, "prepare_decoder_input_ids_from_labels"):
         logger.warning(
             "label_smoothing is enabled but the `prepare_decoder_input_ids_from_labels` method is not defined for"
             f"`{model.__class__.__name__}`. This will lead to loss being calculated twice and will take up more memory"
         )
-
-    def preprocess_function(examples):
-        if data_args.target_column == "combined":
-            inputs = examples[data_args.input_column]
-            targets = ["[PLAIN] " + plain + " [TECHNICAL] " + technical
-                      for plain, technical in zip(examples["plain_text"], examples["technical_text"])]
-        elif data_args.dataset_name == "tomasg25/scientific_lay_summarisation":
-            inputs = ["".join(example.split()[1:]) for example in examples[data_args.input_column]]
-            targets = ["".join(example.split()[0]) for example in examples[data_args.input_column]]
-        else:
-            inputs, targets = examples[data_args.input_column], examples[data_args.target_column]
-
-        if data_args.target_column == "keywords":
-            targets = ["; ".join(target) for target in targets]
-
-        model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
-
-        # Tokenize targets with the `text_target` keyword argument
-        labels = tokenizer(text_target=targets, max_length=max_target_length, padding=padding, truncation=True)
-
-        # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
-        # padding in the loss.
-        if padding == "max_length" and data_args.ignore_pad_token_for_loss:
-            labels["input_ids"] = [
-                [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
-            ]
-
-        model_inputs["labels"] = labels["input_ids"]
-        return model_inputs
 
     # Data collator
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
@@ -608,6 +569,7 @@ def main():
         with training_args.main_process_first(desc="train dataset map pre-processing"):
             train_dataset = train_dataset.map(
                 preprocess_function,
+                fn_kwargs={"data_args": data_args, "tokenizer": tokenizer},
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 remove_columns=column_names,
@@ -658,6 +620,7 @@ def main():
         with training_args.main_process_first(desc="validation dataset map pre-processing"):
             eval_dataset = eval_dataset.map(
                 preprocess_function,
+                fn_kwargs={"data_args": data_args, "tokenizer": tokenizer},
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 remove_columns=column_names,
@@ -675,6 +638,7 @@ def main():
         with training_args.main_process_first(desc="test dataset map pre-processing"):
             test_dataset = test_dataset.map(
                 preprocess_function,
+                fn_kwargs={"data_args": data_args, "tokenizer": tokenizer},
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 remove_columns=column_names,

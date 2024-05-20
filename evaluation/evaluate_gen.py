@@ -170,16 +170,18 @@ def main():
         result["bertscore_pubmed"] = round(sum(result_bs["f1"]) / len(result_bs["f1"]) * 100, 2)
         result = metric_rouge.compute(predictions=full_predictions, references=full_targets)
         
+        
+        full_predictions = " ".join(full_predictions)
+        print_read(full_predictions)
+        """
+
         rouge_scores = global_rouge_scorer.get_scores(references=full_targets, hypothesis=full_predictions)
         result["rouge-1"] = rouge_scores["rouge-1"]["f"]
         result["rouge-2"] = rouge_scores["rouge-2"]["f"]
         result["rouge-l"] = rouge_scores["rouge-l"]["f"]
              
         print(result)
-        """
 
-        full_predictions = " ".join(full_predictions)
-        print_read(full_predictions)
 
 
 if __name__ == "__main__":

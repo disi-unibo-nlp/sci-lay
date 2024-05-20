@@ -125,3 +125,38 @@ def compute_metrics(references, predictions):
     result["bart_score_F"] = round(bart_score_F, 3)
     
     return result
+
+
+def preprocess_function(examples, data_args, tokenizer):
+    
+    max_target_length = data_args.max_target_length
+    padding = "max_length" if data_args.pad_to_max_length else False
+
+    if data_args.target_column == "combined":
+        inputs = examples[data_args.input_column]
+        targets = ["[PLAIN] " + plain + " [TECHNICAL] " + technical
+                    for plain, technical in zip(examples["plain_text"], examples["technical_text"])]
+    elif data_args.dataset_name == "tomasg25/scientific_lay_summarisation":
+        inputs = ["".join(example.split()[1:]) for example in examples[data_args.input_column]]
+        targets = ["".join(example.split()[0]) for example in examples[data_args.input_column]]
+    else:
+        inputs, targets = examples[data_args.input_column], examples[data_args.target_column]
+
+    if data_args.target_column == "keywords":
+        targets = ["; ".join(target) for target in targets]
+
+    model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
+
+    # Tokenize targets with the `text_target` keyword argument
+    labels = tokenizer(text_target=targets, max_length=max_target_length, padding=padding, truncation=True)
+
+    # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
+    # padding in the loss.
+    if padding == "max_length" and data_args.ignore_pad_token_for_loss:
+        labels["input_ids"] = [
+            [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
+        ]
+
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
